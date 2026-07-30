@@ -86,10 +86,6 @@
 // so it wants to be long enough to be unambiguous.
 #define PROXY_POWER_OFF_MS 750
 
-// Ceiling on an explicit "VBUS off" when the console rides on USB. See the
-// PWR_CMD_OFF case for why leaving it off indefinitely would be a trap.
-#define PROXY_POWER_OFF_MAX_MS 30000
-
 // Diagnostic mode re-runs status + a power cycle on this period, so a monitor
 // attached at any time sees a complete enumeration attempt without interaction.
 #define PROXY_DIAG_CYCLE_MS 12000
@@ -324,6 +320,13 @@ static volatile uint8_t g_dev_addr;
 // descriptor APIs must run in loop1 context, never inside a TinyUSB callback.
 static volatile bool g_dump_req;
 
+// The BOOT button is a plain GPIO on this board ("Boot0 also on GPIO #7" in the
+// variant), so it reads normally at runtime -- no need for the flash-CS BOOTSEL
+// trick other RP2040 boards require. It only means "bootloader" when held down
+// during reset. Core 0 owns these.
+static uint32_t g_btn_presses = 0;
+static uint32_t g_btn_last_ms = 0;
+
 // Result of the one-shot D+/D- probe core 1 runs before PIO claims the pins.
 // This is the only trustworthy read of which line carries D+.
 static char const *volatile g_pad_probe_text;
@@ -367,18 +370,13 @@ static void power_service(void) {
       break;
     case PWR_CMD_OFF:
       power_apply(false);
-#if PROXY_ENABLE_CDC
-      // Detaching to mirror the key also takes the CDC console with it -- a USB
-      // device cannot drop only some of its interfaces. Without a deadline an
-      // explicit "off" would remove the only way to send "on", so it expires.
-      // The BOOT button still works throughout.
-      g_power_off_until = millis() + PROXY_POWER_OFF_MAX_MS;
-      LOGF("[pwr] VBUS off (auto-restore in %u ms; console returns with it)\r\n",
-           (unsigned)PROXY_POWER_OFF_MAX_MS);
-#else
-      g_power_off_until = 0;
-      LOGF("[pwr] VBUS off\r\n");
-#endif
+      g_power_off_until = 0; // stays off until something turns it back on
+      // Turning VBUS off detaches the whole USB device, console included -- a
+      // USB device cannot drop only some of its interfaces. That is safe
+      // because the BOOT button toggles power in hardware and always works,
+      // so there is no way to strand the board with no route back.
+      LOGF("[pwr] VBUS off (console drops with it; BOOT button toggles it "
+           "back)\r\n");
       break;
     case PWR_CMD_ON:
       LOGF("[pwr] VBUS on\r\n");
@@ -499,6 +497,13 @@ static void print_status(void) {
        (unsigned long)g_in_dropped);
   LOGF("PC->dev   : %lu sent, %lu dropped\r\n", (unsigned long)g_out_sent,
        (unsigned long)g_out_dropped);
+  LOGF("BOOT btn  : GPIO%u reads %s, %lu press(es)",
+       (unsigned)PIN_BUTTON, digitalRead(PIN_BUTTON) == LOW ? "DOWN" : "up",
+       (unsigned long)g_btn_presses);
+  if (g_btn_presses) {
+    LOGF(", last %lu ms ago", (unsigned long)(millis() - g_btn_last_ms));
+  }
+  LOGF("\r\n");
   LOGF("keys      : p=power-cycle 0=off 1=on i=info\r\n");
 }
 
@@ -571,8 +576,15 @@ static void button_service(void) {
     last_change = millis();
     was_down = down;
     if (down) {
-      LOGF("[btn] power-cycle requested\r\n");
-      g_power_cmd = PWR_CMD_CYCLE;
+      // Counted as well as logged: switching VBUS detaches the USB device, so
+      // the log line below is usually lost before it can be drained to the CDC
+      // console. The counter survives and shows up in the next status print.
+      g_btn_presses++;
+      g_btn_last_ms = millis();
+      bool const turning_off = g_power_is_on;
+      LOGF("[btn] press %lu -- VBUS %s\r\n", (unsigned long)g_btn_presses,
+           turning_off ? "off" : "on");
+      g_power_cmd = turning_off ? PWR_CMD_OFF : PWR_CMD_ON;
     }
   }
 }
@@ -584,7 +596,8 @@ static void button_service(void) {
 // Colour identifies which interface last moved a report, so traffic can be told
 // apart at a glance: keyboard white, FIDO2 yellow, raw HID green, seremu red.
 // Dark when idle -- this is an activity light only. The onboard LED on GPIO 13
-// is the fault light; the two never mean the same thing.
+// carries board state (fault / host port off); the two never overlap in
+// meaning.
 //
 // Driven from PIO1. Pico-PIO-USB owns PIO0 state machines 0-2, so pinning the
 // pixel to PIO1 keeps it from ever competing with the USB host for a state
@@ -742,9 +755,15 @@ static bool core1_alive(void) {
   return alive;
 }
 
-// The onboard LED on GPIO 13 is a fault light, nothing else: dark when idle or
-// working normally, lit when something needs attention. An empty host port is
-// not a fault, so no key attached means dark.
+// The onboard LED on GPIO 13 means three things and only three:
+//
+//   dark     working normally, or simply nothing plugged into the host port
+//   flashing host port powered down -- proof the board itself is still alive,
+//            which matters because cutting VBUS also detaches us from the PC,
+//            so every other sign of life disappears at the same time
+//   lit      something needs attention
+//
+// An empty host port is not a fault, so no key attached means dark.
 //
 // Faults are:
 //   - core 1 wedged, or the host stack never started
@@ -783,8 +802,12 @@ static bool led_fault(void) {
 // look faulty, and flickering on those would train you to ignore the light.
 #define PROXY_LED_FAULT_MS 2000
 
+// Half-period of the "host port is off" heartbeat.
+#define PROXY_LED_FLASH_MS 400
+
 static void led_service(void) {
   static uint32_t changed_at = 0;
+  static uint32_t next_toggle = 0;
   static bool last_fault = false;
   static bool on = false;
 
@@ -794,12 +817,33 @@ static void led_service(void) {
     changed_at = millis();
   }
 
-  bool const want = fault && (millis() - changed_at) >= PROXY_LED_FAULT_MS;
-  if (want != on) {
-    on = want;
-    digitalWrite(PIN_LED, on);
+  // A real fault outranks the heartbeat: steady beats blinking for "look here".
+  if (fault && (millis() - changed_at) >= PROXY_LED_FAULT_MS) {
+    if (!on) {
+      on = true;
+      digitalWrite(PIN_LED, HIGH);
+    }
+    return;
+  }
+
+  if (!g_power_is_on) {
+    if ((int32_t)(millis() - next_toggle) >= 0) {
+      next_toggle = millis() + PROXY_LED_FLASH_MS;
+      on = !on;
+      digitalWrite(PIN_LED, on);
+    }
+    return;
+  }
+
+  if (on) {
+    on = false;
+    digitalWrite(PIN_LED, LOW);
   }
 }
+
+// Defined below with the rest of the device-side presence handling.
+static void usb_present(bool with_hid);
+extern bool g_usb_has_hid;
 
 void setup() {
   PROXY_LOG.begin(115200);
@@ -824,20 +868,6 @@ void setup() {
   // configuration, so detach before touching the descriptors.
   TinyUSBDevice.detach();
   delay(10);
-#if !PROXY_ENABLE_CDC
-  // Pure HID clone: throw the CDC configuration away and build our own.
-  TinyUSBDevice.clearConfiguration();
-#else
-  // Keep the core's configuration and append to it. This is deliberate: the
-  // CDC needs an Interface Association Descriptor for Windows to bind it in a
-  // composite device, and the device-level class/subclass/protocol that go with
-  // an IAD are set inside TinyUSBDevice.begin() with no public setter to
-  // restore them. Building on the existing configuration inherits them.
-#endif
-  TinyUSBDevice.setID(PROXY_VID, PROXY_PID);
-  TinyUSBDevice.setManufacturerDescriptor(PROXY_MANUFACTURER);
-  TinyUSBDevice.setProductDescriptor(PROXY_PRODUCT);
-  TinyUSBDevice.setSerialDescriptor(PROXY_SERIAL);
 
   for (uint8_t i = 0; i < PROXY_MAX_HID; i++) {
     g_hid[i].setReportDescriptor(k_itf[i].desc, k_itf[i].desc_len);
@@ -848,38 +878,102 @@ void setup() {
     g_hid[i].enableOutEndpoint(true);
     g_hid[i].setReportCallback(nullptr, k_set_cb[i]);
 
+    // begin() once, purely to claim this object's HID instance index; the
+    // configuration it appends to here is thrown away immediately below. Every
+    // later rebuild goes through addInterface(), because begin() would
+    // early-return now that the instance is valid.
     if (!g_hid[i].begin()) {
-      LOGF("[dev] FAILED to add interface %u (%s)\r\n", i, k_itf[i].name);
+      LOGF("[dev] FAILED to claim HID instance %u (%s)\r\n", i, k_itf[i].name);
     }
   }
 
-  // Stay detached. Core 1 attaches us once the OnlyKey has enumerated, so the
-  // PC only ever sees the proxy while a key is actually plugged in.
+#if PROXY_ENABLE_CDC
+  // Come up console-only. The HID interfaces are added when the key links, and
+  // removed again whenever it goes away, so the PC sees a real unplug while the
+  // console survives to switch the host port back on.
+  usb_present(false);
+  LOGF("[dev] %04X:%04X up as console-only, waiting for key\r\n", PROXY_VID,
+       PROXY_PID);
+#else
+  // No console to keep alive: stay off the bus until the key appears.
+  g_usb_has_hid = false;
   LOGF("[dev] configured %04X:%04X with %u HID interfaces, waiting for key\r\n",
        PROXY_VID, PROXY_PID, PROXY_MAX_HID);
+#endif
 #endif // PROXY_DIAG
 
   print_status();
   print_help();
 }
 
+// Rebuild the USB configuration from scratch. Core 0 only, and only while
+// detached -- the host must never see the descriptors change underneath it.
+//
+// with_hid=false yields a console-only device: the four HID interfaces vanish
+// from the PC exactly as an unplug would look, while the CDC stays so the board
+// can still be talked to and switched back on.
+//
+// Note that Adafruit_USBD_HID::begin() and Adafruit_USBD_CDC::begin() both
+// early-return once their instance is valid, so they cannot be reused here;
+// addInterface() is the only way to re-add an already-initialised interface to
+// a freshly cleared configuration.
+static void usb_build_config(bool with_hid) {
+  TinyUSBDevice.clearConfiguration();
+  TinyUSBDevice.setID(PROXY_VID, PROXY_PID);
+  TinyUSBDevice.setManufacturerDescriptor(PROXY_MANUFACTURER);
+  TinyUSBDevice.setProductDescriptor(PROXY_PRODUCT);
+  TinyUSBDevice.setSerialDescriptor(PROXY_SERIAL);
+
+#if PROXY_ENABLE_CDC
+  TinyUSBDevice.addInterface(Serial); // console first, so it keeps MI_00/01
+#endif
+
+  if (with_hid) {
+    for (uint8_t i = 0; i < PROXY_MAX_HID; i++) {
+      if (!TinyUSBDevice.addInterface(g_hid[i])) {
+        LOGF("[dev] FAILED to add interface %u (%s)\r\n", i, k_itf[i].name);
+      }
+    }
+  }
+}
+
+// Tracks what the PC is currently being shown, as opposed to what core 1 wants.
+bool g_usb_has_hid = false;
+
+static void usb_present(bool with_hid) {
+  TinyUSBDevice.detach();
+  delay(20); // let the host see the disconnect before the descriptors change
+  usb_build_config(with_hid);
+  delay(10);
+  TinyUSBDevice.attach();
+  g_usb_has_hid = with_hid;
+}
+
 // Core 0 owns the device stack: apply whatever presence core 1 published.
 static void presence_service(void) {
   bool const want = g_pc_present_req;
-  if (want == g_pc_attached) {
+  if (want == g_usb_has_hid) {
     return;
   }
 
+  for (uint8_t i = 0; i < PROXY_MAX_HID; i++) {
+    g_inq[i].flush();
+  }
+
+#if PROXY_ENABLE_CDC
+  LOGF("[dev] re-enumerating %s HID interfaces\r\n", want ? "with" : "WITHOUT");
+  usb_present(want);
+#else
+  // No console to preserve, so simply drop off the bus entirely.
   if (want) {
     LOGF("[dev] attaching to PC\r\n");
-    TinyUSBDevice.attach();
+    usb_present(true);
   } else {
     LOGF("[dev] detaching from PC\r\n");
     TinyUSBDevice.detach();
-    for (uint8_t i = 0; i < PROXY_MAX_HID; i++) {
-      g_inq[i].flush();
-    }
+    g_usb_has_hid = false;
   }
+#endif
   g_pc_attached = want;
 }
 
