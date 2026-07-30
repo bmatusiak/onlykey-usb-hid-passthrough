@@ -81,11 +81,19 @@ the default) or `0` for a direct connection (open-drain, never driven high).
 
 | Interface | Windows name | Purpose |
 |---|---|---|
-| MI_00/01 | USB Serial Device (COM*n*) | control console |
-| MI_02 | HID Keyboard Device | keyboard |
-| MI_03 | HID-compliant fido | FIDO2 / U2F (CTAPHID) |
-| MI_04 | HID-compliant vendor-defined | OnlyKey app raw HID |
-| MI_05 | HID-compliant vendor-defined | Teensy seremu debug |
+| MI_00 | HID Keyboard Device | keyboard |
+| MI_01 | HID-compliant fido | FIDO2 / U2F (CTAPHID) |
+| MI_02 | HID-compliant vendor-defined | OnlyKey app raw HID |
+| MI_03 | HID-compliant vendor-defined | Teensy seremu debug |
+| MI_04 | USB Serial Device (COM*n*) | control console |
+
+**The HID interfaces come first on purpose**, so they land on the same interface
+numbers as a real OnlyKey. Host software routinely locates a raw-HID endpoint by
+interface number — `python-onlykey` accepts `usage_page == 0xffab or
+interface_number == 2`. With the console at MI_00/01 everything shifted up by
+two and an app looking for MI_02 found the *keyboard* instead, then silently
+talked to nothing. Windows binds the CDC by class and IAD, so its position does
+not matter.
 
 It adopts the attached key's identity — `1D50:60FC` for OnlyKey application
 firmware. Windows recognises the FIDO usage page on its own, which is a good
@@ -286,30 +294,41 @@ automatically above that. Stable throughout testing, but it is above spec.
 ## The vendored TinyUSB copy
 
 `lib/Adafruit_TinyUSB_Arduino/` is a **patched copy** of the library bundled
-with the core, and the project will not work without it. Two one-line changes,
-both marked `// PATCHED`:
+with the core, and the project will not work without it. Every change is marked
+`// PATCHED`.
 
-**1. `CFG_TUD_HID_EP_BUFSIZE` 64 → 1152.** HalfKay writes firmware in 1089-byte
-`SET_REPORT`s. The device stack rejected them outright:
+All of them exist because HalfKay writes firmware in **1089-byte** control
+`SET_REPORT`s, which the stock device stack rejects:
 
 ```c
 case HID_REQ_CONTROL_SET_REPORT:
   TU_VERIFY(request->wLength <= CFG_TUD_HID_EP_BUFSIZE);   // 64 -> stall
 ```
 
-That constant is defined **unguarded** in two places, so `-D` cannot override
-it, and `tusb_config.h` cannot be shadowed either — the library quote-includes
-its own copy from its own directory, which always wins. Vendoring is the only
-route.
+`CFG_TUD_HID_EP_BUFSIZE` is defined **unguarded** in two places, so `-D` cannot
+override it, and `tusb_config.h` cannot be shadowed either — the library
+quote-includes its own copy from its own directory, which always wins.
+Vendoring is the only route.
 
-**2. Endpoint packet size pinned to 64** in `Adafruit_USBD_HID::makeItfDesc`.
-That same constant was also passed as the endpoint's `wMaxPacketSize`. At 1152
-that is illegal for a full-speed interrupt endpoint (64 max) and Windows
-rejected the entire configuration with *Invalid Configuration Descriptor*. The
-buffer and the packet size are unrelated and now decoupled.
+Raising it to 1152 works, but **that one constant is overloaded four ways**, and
+each one produced a distinct, hard-to-diagnose failure:
+
+| Where it is used | Symptom when set to 1152 | Fix |
+|---|---|---|
+| Endpoint `wMaxPacketSize` in the interface descriptor | Windows: *Invalid Configuration Descriptor*, whole device rejected | pinned to 64 in `Adafruit_USBD_HID::makeItfDesc` |
+| Control `SET_REPORT` size limit | firmware blocks stalled | **needs 1152** — the original goal |
+| Interrupt OUT endpoint arming | OUT reports never delivered at all | new `CFG_TUD_HID_EP_OUT_PACKET` (64) in `hid_device.c` |
+
+The third is the subtlest. `hidd_open()` and the OUT completion handler arm the
+endpoint with a `CFG_TUD_HID_EP_BUFSIZE`-sized request. A 64-byte packet on a
+64-byte endpoint is **not a short packet**, so a 1152-byte request never
+completes — the stack waits for 18 packets before delivering anything. Control
+writes kept working while interrupt writes silently vanished, which made it look
+like a host-software problem.
 
 To re-vendor after a core update, copy `src/` and `library.properties` from
-`framework-arduinopico/libraries/Adafruit_TinyUSB_Arduino/` and re-apply both.
+`framework-arduinopico/libraries/Adafruit_TinyUSB_Arduino/` and re-apply all
+three.
 
 ---
 
@@ -360,29 +379,36 @@ Two non-obvious constraints live in that path:
   there is no public setter. Windows still binds `usbser.sys` to a CDC-only
   configuration with `bDeviceClass = 0` — verified empirically, not assumed.
 
-### Back-pressure on host→device reports
+### Back-pressure, and where it must NOT be applied
 
-**This is the most important detail in the project.** `set_report_thunk()` runs
-on core 0 from the device stack, and by the time it is called the host has
-*already been ACKed*. Returning without queueing therefore tells the host
-"delivered" while discarding the data — silent loss the sender believes
-succeeded.
+**This is the most important pair of details in the project.**
+`set_report_thunk()` runs from the device stack, and by the time it is called
+the host has *already been ACKed*. Returning without queueing therefore tells
+the host "delivered" while discarding the data — silent loss the sender believes
+succeeded. With an earlier 4-slot queue a firmware flash lost **162 of 210
+blocks**; both the official Teensy Loader and the CLI tool reported success and
+wrote a corrupt image, which looked for hours like a bootloader problem.
 
-That is harmless for a keystroke and catastrophic for a firmware block. With an
-earlier 4-slot queue, a firmware flash pushed 210 blocks back-to-back faster
-than core 1 could forward them as control transfers, and **162 of 210 blocks
-were dropped**. Both the official Teensy Loader and the CLI tool reported
-success and wrote a corrupt image; the key then would not boot, which looked for
-hours like a bootloader-entry problem rather than data loss.
+The obvious fix — block until a slot frees — is correct for firmware blocks and
+**catastrophic for everything else**, because that callback runs in **USB IRQ
+context** and `tud_task()` is what re-arms the interrupt OUT endpoint after each
+packet. Blocking there prevents the very draining it waits for: the first few
+packets land, the queue backs up, and interrupt OUT wedges permanently. Raw HID
+traffic died after ~3 reports while control transfers kept working.
 
-So the queue is 8 slots deep and, when full, the callback **blocks** for up to
-`PROXY_OUT_BLOCK_MS` (250 ms) waiting for a slot rather than dropping. Core 1
-drains independently, so spinning cannot deadlock; the bound stops a wedged host
-stack from hanging the device stack forever. A correct flash now reports
-`PC->dev : 210 sent, 0 dropped` and takes ~6.8 s rather than a dishonest 3.8 s.
+So the rule is split by size:
 
-If you change anything in the OUT path, check that counter after a flash. Drops
-there mean corrupted firmware, not dropped keystrokes.
+- **> `PROXY_SMALL_REPORT_MAX` (64 bytes)** — a control-pipe firmware block, from
+  a synchronous host sending one at a time with core 1 otherwise idle. Waits up
+  to `PROXY_OUT_BLOCK_MS` for a slot. Losing one corrupts firmware.
+- **<= 64 bytes** — an ordinary HID report. **Never blocks.** The queue is deep
+  enough that core 1 keeps up, and a dropped keystroke is survivable.
+
+Verified: 20 consecutive raw-HID writes all forwarded with a reply for each, and
+a full firmware flash at `PC->dev : 210 sent, 0 dropped`.
+
+If you touch the OUT path, check `PC->dev` after both a flash *and* a burst of
+raw-HID traffic. The two exercise opposite halves of this rule.
 
 ### IN endpoint arming
 
@@ -460,7 +486,9 @@ Top of `src/main.cpp`.
 | `PROXY_BOOTSEL_AUTO` | `1` | Auto-pulse the contact when the port stays silent |
 | `PROXY_MAX_OUT_REPORT` | `1152` | Largest host→device report; sized for HalfKay's 1089 bytes |
 | `PROXY_OUT_QUEUE_LEN` | `8` | Host→device queue depth. Too shallow silently corrupts firmware writes |
-| `PROXY_OUT_BLOCK_MS` | `250` | How long to wait for a free slot before giving up (see *back-pressure*) |
+| `PROXY_OUT_BLOCK_MS` | `250` | How long a large report waits for a free slot (see *back-pressure*) |
+| `PROXY_SMALL_REPORT_MAX` | `64` | At or below this, a report never blocks the IRQ |
+| `PROXY_IN_QUEUE_LEN` | `32` | Device→PC queue depth per interface |
 | `PROXY_BOOTSEL_REBOOT_GRACE_MS` | `30000` | Silence tolerated before poking a key that has already enumerated once |
 | `PROXY_ARM_DELAY_MS` | `500` | Settle time before first polling an interface |
 | `PROXY_POWER_OFF_MS` | `750` | Off duration for `p` |
@@ -505,10 +533,10 @@ callback must answer synchronously, so control-pipe `GET_REPORT` returns a
 stall. Affects Feature reports on the keyboard and seremu interfaces; CTAPHID
 and the OnlyKey app use interrupt transfers.
 
-**Interface numbering.** With `PROXY_ENABLE_CDC=1` the HID interfaces sit at
-MI_02+ rather than MI_00+. Nothing binds by interface number — Windows matches
-FIDO2 by usage page, the OnlyKey app by VID/PID — but set `PROXY_ENABLE_CDC=0`
-if you need an exact clone.
+**Interface numbering.** HID is emitted first so the cloned interfaces match a
+real OnlyKey (rawhid at MI_02); the console takes the tail. Do not reorder
+`usb_build_config()` — host software does locate raw HID by interface number,
+and getting this wrong makes apps talk to the keyboard instead.
 
 **Descriptor size ceiling.** Report descriptors larger than
 `CFG_TUH_ENUMERATION_BUFSIZE` (256) are not delivered by TinyUSB and such an
@@ -520,16 +548,18 @@ interface cannot be cloned.
 
 **Verified working:**
 
-- Application mode: all interfaces cloned and linked, PC mounts the proxy,
-  reports forwarding both directions
-- Bootloader mode: HalfKay cloned and presented as `16C0:0478`, HID capabilities
-  byte-identical to a direct connection
-- **A complete, correct firmware flash through the proxy** — 210 blocks,
-  215 KB, `PC->dev : 210 sent, 0 dropped`, after which the key boots the new
-  firmware and returns to application mode on its own
+- Application mode: all interfaces cloned and linked, PC mounts the proxy
+- Bootloader mode: HalfKay cloned as `16C0:0478`, HID capabilities byte-identical
+  to a direct connection
+- **A complete, correct firmware flash through the proxy** — 210 blocks, 215 KB,
+  `PC->dev : 210 sent, 0 dropped`, after which the key boots the new firmware
+- **Bidirectional raw HID with real OnlyKey software** — `python-onlykey`
+  connects, sends commands and reads protocol replies through the proxy
+  (`Error OnlyKey must be initialized first` is the key answering, not a
+  transport failure)
+- 20 consecutive interrupt-OUT writes forwarded with a reply for each, zero drops
 - Automatic recovery of a descriptor-less key via the bootloader contact
-- Power off/on and power-cycle, by console and by BOOT button
-- Console-only re-enumeration while the host port is off, and recovery from it
+- Power control by console and BOOT button; console-only re-enumeration
 - Clean build under `-Wall -Wextra` across all three environments
 
 **Not verified — needs a human at the keyboard:**

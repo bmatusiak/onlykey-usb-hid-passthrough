@@ -144,6 +144,10 @@
 // refuse, so waiting is the only way to avoid losing data.
 #define PROXY_OUT_BLOCK_MS 250
 
+// Anything this size or smaller is an ordinary HID report and must never block
+// the IRQ; larger means a control-pipe firmware block, which may.
+#define PROXY_SMALL_REPORT_MAX 64
+
 #define PROXY_MAX_HID 4
 static_assert(PROXY_MAX_HID <= CFG_TUD_HID,
               "raise -DCFG_TUD_HID in platformio.ini");
@@ -583,16 +587,23 @@ static void set_report_thunk(uint8_t report_id, hid_report_type_t report_type,
   // Interrupt-OUT traffic arrives with report_id == 0 and the raw report in the
   // buffer. None of the OnlyKey's descriptors declare report IDs, so the buffer
   // passes through untouched.
-  // Back-pressure rather than drop. This callback runs on core 0 from the
-  // device stack, and returning without queueing still ACKs the SET_REPORT to
-  // the host -- so a drop is silent data loss the host believes succeeded.
-  // Harmless for a keystroke; catastrophic for a firmware block, which is
-  // exactly how 162 of 210 blocks were lost while the flasher reported success.
+  // Returning without queueing still ACKs the report to the host, so a drop is
+  // silent data loss the host believes succeeded -- that is how 162 of 210
+  // firmware blocks were lost while the flasher reported success.
   //
-  // Core 1 drains the queue independently, so spinning here does not deadlock.
-  // Bounded so a wedged host stack cannot hang the device stack forever.
+  // But this callback runs in USB IRQ context, and tud_task() is what re-arms
+  // the interrupt OUT endpoint after each packet. Blocking here therefore
+  // prevents the very draining it is waiting for: the first few packets land,
+  // the queue backs up, and interrupt OUT wedges permanently.
+  //
+  // So only the large control-pipe firmware blocks wait. Those come from a
+  // synchronous host that sends one at a time with core 1 otherwise idle, so a
+  // brief spin is safe and prevents corruption. Ordinary reports (<= 64 bytes,
+  // every real HID interface here) never block; the queue is deep enough that
+  // core 1 keeps up, and a dropped keystroke is survivable where a dropped
+  // firmware block is not.
   out_report_t *slot = g_outq[ITF].reserve();
-  if (!slot) {
+  if (!slot && bufsize > PROXY_SMALL_REPORT_MAX) {
     uint32_t const deadline = millis() + PROXY_OUT_BLOCK_MS;
     while (!slot && (int32_t)(millis() - deadline) < 0) {
       slot = g_outq[ITF].reserve();

@@ -55,6 +55,11 @@ typedef struct {
 } hidd_interface_t;
 
 typedef struct {
+// PATCHED: full-speed interrupt endpoints carry at most 64 bytes per packet.
+#ifndef CFG_TUD_HID_EP_OUT_PACKET
+#define CFG_TUD_HID_EP_OUT_PACKET 64
+#endif
+
   TUD_EPBUF_DEF(ctrl , CFG_TUD_HID_EP_BUFSIZE);
   TUD_EPBUF_DEF(epin , CFG_TUD_HID_EP_BUFSIZE);
   TUD_EPBUF_DEF(epout, CFG_TUD_HID_EP_BUFSIZE);
@@ -263,7 +268,12 @@ uint16_t hidd_open(uint8_t rhport, tusb_desc_interface_t const *desc_itf, uint16
 
   // Prepare for output endpoint
   if (p_hid->ep_out) {
-    TU_ASSERT(usbd_edpt_xfer(rhport, p_hid->ep_out, p_epbuf->epout, CFG_TUD_HID_EP_BUFSIZE, false), drv_len);
+// PATCHED: arm the interrupt OUT endpoint for one max-size PACKET, not the whole
+// report buffer. CFG_TUD_HID_EP_BUFSIZE is 1152 here so a 1089-byte control
+// SET_REPORT fits, but a 64-byte packet on a 64-byte endpoint is not a short
+// packet -- requesting 1152 makes the stack wait for 18 packets before ever
+// completing, so interrupt-OUT reports silently never arrive.
+    TU_ASSERT(usbd_edpt_xfer(rhport, p_hid->ep_out, p_epbuf->epout, CFG_TUD_HID_EP_OUT_PACKET, false), drv_len);
   }
 
   return drv_len;
@@ -413,7 +423,8 @@ bool hidd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_
     }
 
     // prepare for new transfer
-    TU_ASSERT(usbd_edpt_xfer(rhport, p_hid->ep_out, p_epbuf->epout, CFG_TUD_HID_EP_BUFSIZE, false));
+    // PATCHED: see the note in hidd_open() -- one packet, not the whole buffer.
+    TU_ASSERT(usbd_edpt_xfer(rhport, p_hid->ep_out, p_epbuf->epout, CFG_TUD_HID_EP_OUT_PACKET, false));
   }
 
   return true;
