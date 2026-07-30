@@ -31,6 +31,7 @@
 #include <hardware/clocks.h>
 #include <hardware/gpio.h>
 #include <hardware/pio.h>
+#include <hardware/watchdog.h>
 #include <hardware/sync.h>
 
 // pio_usb.h must come first: its presence is what puts tusb_config into
@@ -117,8 +118,12 @@
 //      reset-time pull-down sits on the contact and can read as a stuck press
 //      -- which is exactly what stopped the key enumerating once wired this
 //      way.
+// DEFAULT IS 0 (direct wire) because that is what is on the bench. Getting this
+// wrong is not a no-op: with a direct wire and ACTIVE_HIGH=1, "released" drives
+// the pin LOW, which grounds the key's bootloader contact permanently and stops
+// it booting at all. Only set 1 once a transistor is actually fitted.
 #ifndef PROXY_BOOTSEL_ACTIVE_HIGH
-#define PROXY_BOOTSEL_ACTIVE_HIGH 1
+#define PROXY_BOOTSEL_ACTIVE_HIGH 0
 #endif
 
 // How long to hold the contact. A brief tap is all a Teensy-style program
@@ -784,10 +789,13 @@ static void bootsel_service(void) {
 }
 
 static void print_help(void) {
-  LOGF("commands: i=status  h=host pins  b=tap bootloader contact  "
-       "B=hold it through a power cycle  x=stored report descriptors  "
-       "d=live descriptor dump  p=power-cycle  0=VBUS off  1=VBUS on  "
-       "t=toggle 3s heartbeat (%s)  ?=help\r\n",
+  LOGF("commands:\r\n"
+       "  R    reboot RP2040 -> puts the KEY into its bootloader (direct wire)\r\n"
+       "  b    pulse contact (only wakes a key that is not enumerating)\r\n"
+       "  p    power-cycle host port      0 / 1   VBUS off / on\r\n"
+       "  i    status                     h       host pins\r\n"
+       "  x    stored descriptors         d       live descriptor dump\r\n"
+       "  t    3s heartbeat (%s)          ?       help\r\n",
        g_heartbeat ? "on" : "off");
 }
 
@@ -833,22 +841,29 @@ static void console_service(void) {
       g_dump_req = true; // core 1 performs it; sync APIs need loop1 context
       break;
     case 'b':
-      // Tap the contact on a running key. A Teensy-style program button reboots
-      // straight into the bootloader, no power cycle needed -- this is what
-      // happened when the button was pressed by hand on a live key.
+      // Pulse the contact. Does NOTHING to a running key -- measured, including
+      // a 3-second hold -- because the key samples this only at power-up. Kept
+      // for the descriptor-less state, where it is what wakes the key up. To
+      // enter the bootloader deliberately, use 'R'.
       bootsel_assert();
       g_bootsel_until = millis() + PROXY_BOOTSEL_HOLD_MS;
       LOGF("[bsel] contact held low for %u ms\r\n",
            (unsigned)PROXY_BOOTSEL_HOLD_MS);
       break;
-    case 'B':
-      // Hold the contact across a power cycle, mirroring "hold the button while
-      // plugging it in" for keys that only sample the button at startup.
-      bootsel_assert();
-      g_bootsel_until =
-          millis() + PROXY_POWER_OFF_MS + PROXY_BOOTSEL_HOLD_MS + 250;
-      g_power_cmd = PWR_CMD_CYCLE;
-      LOGF("[bsel] holding contact through a power cycle\r\n");
+    case 'R':
+      // Reboot the RP2040 to put the attached key into ITS bootloader.
+      //
+      // The key only samples its bootloader contact at power-up, and our VBUS
+      // switch cannot truly de-power it (phantom power through D+/D-). An
+      // RP2040 reset does both at once: GPIO18 goes undriven so the load
+      // switch really opens, and GPIO6 reverts to input-with-pull-down,
+      // holding the contact grounded across the key's power-up.
+      //
+      // Direct-wire only. With a transistor the same pull-down holds the gate
+      // OFF, so the contact is released and the key boots normally.
+      LOGF("[bsel] rebooting RP2040 for key bootloader entry\r\n");
+      delay(50); // let the log drain before the port disappears
+      watchdog_reboot(0, 0, 0);
       break;
     case 'x':
     case 'X':
@@ -1134,8 +1149,12 @@ static bool led_fault(void) {
   if (linked == 0) {
     return false; // empty port is a normal resting state, not a problem
   }
-  if (linked < PROXY_MAX_HID) {
-    return true; // key present but an interface failed to match
+  // Compare against what the host stack actually bound, NOT PROXY_MAX_HID: a
+  // bootloader legitimately exposes a single interface, and demanding four made
+  // a perfectly healthy key look like a fault.
+  uint8_t const bound = g_host_hid_count;
+  if (bound && linked < bound) {
+    return true; // an interface the host bound failed to clone
   }
 #if PROXY_DIAG
   // Diagnostic builds never present anything to the PC, so stop here.

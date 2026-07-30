@@ -70,8 +70,14 @@ connector, so this is one wire plus the part.
 This also keeps the Feather's pin off the OnlyKey's button line entirely, so
 nothing can back-feed the key while it is unpowered.
 
-Set `PROXY_BOOTSEL_ACTIVE_HIGH` to `1` for a transistor (drive high to press,
-the default) or `0` for a direct connection (open-drain, never driven high).
+Set `PROXY_BOOTSEL_ACTIVE_HIGH` to `0` for a direct connection (the **default**,
+open-drain, never driven high) or `1` once a transistor is fitted (drive high).
+
+**This is not a harmless preference.** With a direct wire and `ACTIVE_HIGH=1`,
+"released" drives the pin *low*, which grounds the key's bootloader contact
+permanently and stops it booting at all — the key goes completely dark and looks
+broken. The default matches a direct wire so a plain `pio run` is always safe;
+only opt into `1` when the transistor is physically present.
 
 ---
 
@@ -138,8 +144,8 @@ Open the COM port at 115200 (`pio device monitor`). Single keypresses, no Enter:
 |---|---|
 | `p` | power-cycle the host port (off 750 ms, on) |
 | `0` / `1` | host port off (stays off) / on |
-| `b` | tap the bootloader contact — reboots a running key into its bootloader |
-| `B` | hold the contact through a power cycle — for keys that only sample it at startup |
+| `R` | **reboot the RP2040 — this is what puts the KEY into its bootloader** |
+| `b` | pulse the bootloader contact; only wakes a key that is not enumerating |
 | `i` | status: core health, link state, per-slot counters, button, pins |
 | `h` | raw D+/D− pad levels and the pre-init probe result |
 | `x` | re-print the report descriptors captured from the attached device |
@@ -422,25 +428,61 @@ which stalled forwarding after a few hundred reports. `tuh_hid_receive_ready()`
 is false while a request is pending, so this only re-issues when the chain has
 genuinely broken. The `rearm` counter in `i` shows when that happens.
 
-### Bootloader auto-recovery
+### Entering the key's bootloader — the exact procedure
+
+The key samples its bootloader contact **only at power-up**. Grounding it while
+the key is running does nothing; this was measured, including a 3-second hold.
+Two consequences follow, and both are counter-intuitive:
+
+- **`b` will not put a running key into the bootloader.** It is only useful for
+  a key that is not enumerating at all.
+- **The `p` / `0` / `1` VBUS commands cannot help either.** Phantom power through
+  D+/D− means cutting VBUS does not actually de-power the key, so it never gets
+  the fresh startup at which the contact is read.
+
+What works is **`R`** — reboot the RP2040 — because an RP2040 reset happens to do
+both required things at once:
+
+1. GPIO 18 goes undriven, so the load switch genuinely opens and the key really
+   loses power (unlike the VBUS commands).
+2. GPIO 6 reverts to input-with-pull-down, holding the contact grounded across
+   the key's power-up.
+
+So the exact sequence is:
+
+```bash
+# 1. put the key into its bootloader
+#    press R in the console, or simply reflash the Feather -- same mechanism
+#    verify: the port reappears as 16C0:0478
+
+# 2. flash
+python tools/halfkay_flash.py firmware.hex
+
+# 3. verify
+#    the port returns as 1D50:60FC with all interfaces cloned, and
+#    PC->dev in the `i` output must read "N sent, 0 dropped"
+```
+
+**`R` is direct-wire only.** With a transistor the same reset-time pull-down
+holds the gate *off*, releasing the contact, so the key boots normally instead —
+which is the safer behaviour for everyday use but means bootloader entry then
+needs the key's own button.
+
+### Recovering a key that is not enumerating
 
 A key powered down *while in its bootloader* comes back with **no USB
 descriptors at all** — silent on the bus, indistinguishable from an empty port.
-It is not broken; it just needs the bootloader contact poked.
+It is not broken; the contact needs poking.
 
 When the port stays silent with power on, the firmware pulses the contact, up to
-3 attempts, then stops rather than poking forever. This requires the GPIO 6
-wiring above; without it, recover by hand.
+3 attempts, then stops rather than poking forever. The wait depends on history:
 
-The wait depends on whether anything has been seen since power-up:
-
-- **Nothing ever enumerated** → `PROXY_BOOTSEL_AUTO_MS` (6 s). This is the
-  genuinely stuck case.
+- **Nothing ever enumerated** → `PROXY_BOOTSEL_AUTO_MS` (6 s). Genuinely stuck.
 - **A device appeared and went away** → `PROXY_BOOTSEL_REBOOT_GRACE_MS` (30 s).
   It is probably rebooting into firmware just flashed through us, and reboots
-  can take well over 6 s. Poking then knocks it straight back into the
-  bootloader, which loops forever — an earlier 6 s-for-everything rule did
-  exactly that after every flash.
+  can take well over 6 s. Poking then knocks it back into the bootloader, which
+  loops forever — an earlier 6 s-for-everything rule did exactly that after
+  every flash.
 
 The distinction is a *longer wait*, not a refusal: an earlier version latched
 "seen a device" and never cleared it on a physical unplug, leaving a genuinely
@@ -482,7 +524,7 @@ Top of `src/main.cpp`.
 |---|---|---|
 | `PROXY_ENABLE_CDC` | `1` | Include the CDC console. `0` gives a HID-only clone with the console on the UART (GPIO 0/1) — independent of USB, needs a USB-TTL adapter |
 | `PROXY_BOOTSEL_PIN` | `6` | GPIO wired to the OnlyKey bootloader contact |
-| `PROXY_BOOTSEL_ACTIVE_HIGH` | `1` | `1` = via transistor (drive high), `0` = direct open-drain |
+| `PROXY_BOOTSEL_ACTIVE_HIGH` | `0` | `0` = direct wire (open-drain), `1` = via transistor. Wrong value bricks bootup — see Hardware |
 | `PROXY_BOOTSEL_AUTO` | `1` | Auto-pulse the contact when the port stays silent |
 | `PROXY_MAX_OUT_REPORT` | `1152` | Largest host→device report; sized for HalfKay's 1089 bytes |
 | `PROXY_OUT_QUEUE_LEN` | `8` | Host→device queue depth. Too shallow silently corrupts firmware writes |
@@ -524,6 +566,10 @@ It is not broken; it needs the bootloader contact poked, which is what the
 auto-recovery above does. Without the GPIO 6 wiring, unplug it and re-insert it
 while holding its bootloader button.
 
+**The bootloader contact is sampled only at power-up.** Grounding it on a
+running key does nothing, so `b` cannot trigger bootloader entry and neither can
+the VBUS commands. Use `R`. See *Entering the key's bootloader* above.
+
 **Core 1 stalls.** Core 1 has wedged during device mode transitions, in both the
 proxy and `diag` builds. Recovery requires a reset — which power-cycles the key.
 The `last phase:` field in `i` reports where it stopped; not yet root-caused.
@@ -559,6 +605,8 @@ interface cannot be cloned.
   transport failure)
 - 20 consecutive interrupt-OUT writes forwarded with a reply for each, zero drops
 - Automatic recovery of a descriptor-less key via the bootloader contact
+- **The full cycle exercised end to end**: bootloader entry, flash, reboot,
+  return to application mode, raw-HID response — repeatedly, zero drops
 - Power control by console and BOOT button; console-only re-enumeration
 - Clean build under `-Wall -Wextra` across all three environments
 
