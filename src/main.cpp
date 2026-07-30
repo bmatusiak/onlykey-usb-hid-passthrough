@@ -33,10 +33,17 @@
 #include <hardware/pio.h>
 #include <hardware/watchdog.h>
 #include <hardware/sync.h>
+#include <pico/bootrom.h>
 
 // pio_usb.h must come first: its presence is what puts tusb_config into
 // PIO-host mode when Adafruit_TinyUSB.h is pulled in.
 #include "pio_usb.h"
+
+// Counts how often the PATCHED Pico-PIO-USB gave up waiting on a PIO flag.
+// Nonzero means the bus desynced and a transaction was abandoned -- recoverable,
+// but it is the exact condition that used to hang the host stack forever, so it
+// is reported rather than swallowed. See lib/Pico_PIO_USB/PATCHES.md.
+extern "C" volatile uint32_t pio_usb_tx_timeouts;
 
 #include "Adafruit_TinyUSB.h"
 
@@ -152,6 +159,43 @@
 // Anything this size or smaller is an ordinary HID report and must never block
 // the IRQ; larger means a control-pipe firmware block, which may.
 #define PROXY_SMALL_REPORT_MAX 64
+
+// How long core 1 may go without completing a loop before we treat it as wedged
+// and reset the board.
+//
+// This exists because a wedge is otherwise INVISIBLE and destructive. Core 1
+// runs the host stack, so when it stops, forward_out() stops with it -- but
+// core 0 keeps answering the PC perfectly. tud_hid_set_report_cb() is void, so
+// a report we cannot queue is dropped after the host has already been told the
+// transfer succeeded. The result is a flashing tool that writes all 210 blocks,
+// reports success, sends its reboot, logs IMG_REBOOT_OK -- and the key received
+// none of it. That is exactly how this failure presented, and it cost a long
+// time to find precisely because every layer above claimed everything worked.
+//
+// Resetting turns that silent corruption into an honest error: our device drops
+// off the bus mid-transfer, so the tool fails loudly instead of lying.
+//
+// Generous enough not to fire on legitimate work: a descriptor dump uses the
+// synchronous tuh_* APIs and can hold core 1 for a while, so dumps disarm it.
+#define PROXY_CORE1_WATCHDOG_MS 3000
+
+// Pico-PIO-USB waits on PIO hardware flags with no timeout of its own, e.g.
+//   while ((pp->pio_usb_tx->irq & IRQ_TX_EOP_MASK) == 0) { continue; }
+// so a desynced state machine hangs the host task forever. Nothing inside the
+// library recovers from that; the watchdog above is the only way out.
+
+// After a HalfKay block-0 write, hold off before forwarding anything else.
+//
+// Writing block 0 triggers a full chip erase that takes seconds, during which
+// the bootloader NAKs everything. teensy_loader_cli sleeps 3 s here and so does
+// tools/halfkay_flash.py -- but a proxy cannot rely on the PC doing that,
+// because the PC is talking to US, not to the key. The OnlyKey GUI sends block
+// 1 immediately, and the erase window was then absorbed as ~390 retried control
+// transfers hammering a busy device (measured: blocks 1/2/3 retried 138/181/73
+// times). The flash still completed, but that burst is the most plausible
+// trigger for the PIO desync above. Enforcing the delay here makes every
+// flashing tool behave, whether or not it waits.
+#define PROXY_HALFKAY_ERASE_MS 3000
 
 #define PROXY_MAX_HID 4
 static_assert(PROXY_MAX_HID <= CFG_TUD_HID,
@@ -356,6 +400,11 @@ static spsc_queue<out_report_t, PROXY_OUT_QUEUE_LEN> g_outq[PROXY_MAX_HID];
 // Each counter is written by exactly one core.
 static volatile uint32_t g_in_sent, g_in_dropped;
 static volatile uint32_t g_out_sent, g_out_dropped;
+// Set the first time a PC->device report is discarded, and never cleared while
+// the board runs. A drop is data the PC was told we delivered, so it must not
+// scroll away in the log -- the LED stays lit and status keeps saying so until
+// the board is reset.
+static volatile bool g_out_drop_flag;
 
 // --------------------------------------------------------------------------
 // VBUS control -- owned by core 1, requested by core 0
@@ -608,15 +657,32 @@ static void set_report_thunk(uint8_t report_id, hid_report_type_t report_type,
   // every real HID interface here) never block; the queue is deep enough that
   // core 1 keeps up, and a dropped keystroke is survivable where a dropped
   // firmware block is not.
+  //
+  // The spin is pointless once core 1 has stopped draining, so watch its tick
+  // counter and give up the moment it stops moving. Waiting 250 ms per report
+  // for a core that is never coming back just slows the inevitable, and the
+  // watchdog needs core 0 running to notice and reset.
   out_report_t *slot = g_outq[ITF].reserve();
   if (!slot && bufsize > PROXY_SMALL_REPORT_MAX) {
-    uint32_t const deadline = millis() + PROXY_OUT_BLOCK_MS;
-    while (!slot && (int32_t)(millis() - deadline) < 0) {
+    uint32_t const started = millis();
+    uint32_t const ticks_at_entry = g_core1_ticks;
+    while (!slot && (millis() - started) < PROXY_OUT_BLOCK_MS) {
+      // 20 ms without core 1 completing a single loop means it is wedged, not
+      // merely busy: it normally ticks millions of times a minute.
+      if ((millis() - started) > 20 && g_core1_ticks == ticks_at_entry) {
+        break;
+      }
       slot = g_outq[ITF].reserve();
     }
   }
   if (!slot) {
+    // Silent loss. We have already ACKed this transfer, so the PC believes it
+    // succeeded and there is no way left to tell it otherwise -- record it
+    // loudly instead, because a run that ends "210 blocks sent, success" while
+    // the device received nothing is the single most misleading state this
+    // firmware can be in.
     g_out_dropped++;
+    g_out_drop_flag = true; // sticky: surfaces in status and on the LED
     return;
   }
   if (bufsize > sizeof(slot->data)) {
@@ -650,6 +716,11 @@ static void print_status(void) {
                                                         : "?");
   LOGF("host stack: %s, %u HID itf bound\r\n",
        g_host_started ? "started" : "NOT STARTED", g_host_hid_count);
+  if (pio_usb_tx_timeouts) {
+    LOGF("PIO bus   : %lu timeout(s) -- the bus desynced and a transaction was "
+         "abandoned (this used to hang the stack forever)\r\n",
+         (unsigned long)pio_usb_tx_timeouts);
+  }
   LOGF("VBUS      : %s (GPIO%u reads %u)\r\n", g_power_is_on ? "on" : "off",
        (unsigned)PIN_5V_EN, gpio_get(PIN_5V_EN) ? 1u : 0u);
 
@@ -682,6 +753,10 @@ static void print_status(void) {
        (unsigned long)g_in_dropped);
   LOGF("PC->dev   : %lu sent, %lu dropped\r\n", (unsigned long)g_out_sent,
        (unsigned long)g_out_dropped);
+  if (g_out_drop_flag) {
+    LOGF("  ** reports were DROPPED after being ACKed to the PC -- whatever "
+         "sent them was told they succeeded **\r\n");
+  }
   LOGF("BOOT btn  : GPIO%u reads %s, %lu press(es)",
        (unsigned)PIN_BUTTON, digitalRead(PIN_BUTTON) == LOW ? "DOWN" : "up",
        (unsigned long)g_btn_presses);
@@ -690,6 +765,51 @@ static void print_status(void) {
   }
   LOGF("\r\n");
   LOGF("keys      : p=power-cycle 0=off 1=on i=info\r\n");
+}
+
+// One line, fixed field order, easy to parse. This is the interface a script
+// gates on -- the human-readable block above is for people and its layout is
+// not stable enough to depend on.
+//
+// The whole point is fail-fast: a flashing tool reads this between batches and
+// aborts the moment anything is wrong, instead of writing 210 blocks into a
+// dead proxy and reporting success. Every field here is something that, if
+// wrong, means the bytes did not arrive.
+//
+//   core1=ok|STALLED|FATAL   is the host stack running at all
+//   drops=N dropflag=0|1     data discarded after the PC was told it landed
+//   sent=N                   host->device reports actually delivered
+//   itf=N                    interfaces currently linked
+//   vid/pid                  what is attached, so a script can confirm the
+//                            key is in the mode it thinks it is
+static void print_health(void) {
+  LOGF("[health] core1=%s drops=%lu dropflag=%u sent=%lu in=%lu indrops=%lu "
+       "piotimeouts=%lu itf=%u mounted=%u vid=%04X pid=%04X\r\n",
+       g_core1_fatal ? "FATAL" : (core1_alive() ? "ok" : "STALLED"),
+       (unsigned long)g_out_dropped, g_out_drop_flag ? 1u : 0u,
+       (unsigned long)g_out_sent, (unsigned long)g_in_sent,
+       (unsigned long)g_in_dropped, (unsigned long)pio_usb_tx_timeouts,
+       g_host_hid_count, TinyUSBDevice.mounted() ? 1u : 0u, g_dev_vid,
+       g_dev_pid);
+}
+
+// Zero the counters so a run's numbers describe only that run.
+//
+// This is the one way to clear the sticky drop flag without a reset. That is
+// deliberate: the flag exists so a drop cannot scroll away unnoticed, and an
+// operator explicitly starting a fresh run is a different act from the
+// firmware quietly forgetting.
+static void reset_counters(void) {
+  g_out_sent = 0;
+  g_out_dropped = 0;
+  g_in_sent = 0;
+  g_in_dropped = 0;
+  g_out_drop_flag = false;
+  for (uint8_t i = 0; i < PROXY_MAX_HID; i++) {
+    g_link[i].in_count = 0;
+    g_link[i].rearms = 0;
+  }
+  LOGF("[health] counters zeroed\r\n");
 }
 
 // When set, status repeats on its own every 3 s. Off by default so the log
@@ -800,7 +920,9 @@ static void print_help(void) {
        "  p    power-cycle host port      0 / 1   VBUS off / on\r\n"
        "  i    status                     h       host pins\r\n"
        "  x    stored descriptors         d       live descriptor dump\r\n"
-       "  t    3s heartbeat (%s)          ?       help\r\n",
+       "  t    3s heartbeat (%s)          ?       help\r\n"
+       "  s    health line (for scripts)  z       zero counters\r\n"
+       "  v    verbose PC->dev reports    U       RP2040 BOOTSEL (reflash me)\r\n",
        g_heartbeat ? "on" : "off");
 }
 
@@ -840,6 +962,26 @@ static void console_service(void) {
     case 'V':
       g_out_verbose = !g_out_verbose;
       LOGF("[out] verbose %s\r\n", g_out_verbose ? "ON" : "off");
+      break;
+    case 's':
+    case 'S':
+      print_health(); // machine-readable; scripts gate on this
+      break;
+    case 'z':
+    case 'Z':
+      reset_counters();
+      break;
+    case 'U':
+      // Drop the RP2040 into its own ROM bootloader so a new proxy build can be
+      // uploaded without anyone reaching for the BOOTSEL button. The rig is
+      // meant to run unattended, and this was the last link in the chain that
+      // still needed fingers.
+      LOGF("[boot] entering RP2040 BOOTSEL -- copy firmware.uf2 to the drive\r\n");
+      for (uint8_t i = 0; i < 20 && !g_log_ring.empty(); i++) {
+        drain_log();
+        delay(5);
+      }
+      reset_usb_boot(0, 0);
       break;
     case 't':
     case 'T':
@@ -1128,6 +1270,62 @@ static bool core1_alive(void) {
   return alive;
 }
 
+// Core 0: reset the board if core 1 stops making progress.
+//
+// See PROXY_CORE1_WATCHDOG_MS for why this is not optional. Core 0 cannot
+// simply restart the host stack -- the wedge is a spin inside Pico-PIO-USB on
+// core 1, so core 1 is never coming back to be told anything, and its PIO state
+// machines and DMA channels are left mid-transfer. A full reset is the only
+// state we can actually reach from here.
+//
+// Deliberately fires even with nothing attached: a wedge with an empty port is
+// still a wedge, and recovering quietly beats sitting dead with the LED lit.
+static void core1_watchdog_service(void) {
+  static uint32_t last_ticks = 0;
+  static uint32_t last_progress = 0;
+
+  if (g_core1_fatal) {
+    return; // already reported itself; leave the LED lit rather than loop-reset
+  }
+
+  uint32_t const now = millis();
+  if (g_core1_ticks != last_ticks) {
+    last_ticks = g_core1_ticks;
+    last_progress = now;
+    return;
+  }
+  if (!last_progress) {
+    last_progress = now; // first call: start the clock, do not judge yet
+    return;
+  }
+
+  // A descriptor dump legitimately holds core 1 in synchronous transfers, so
+  // do not count that time against it.
+  if (g_dump_req) {
+    last_progress = now;
+    return;
+  }
+
+  if ((uint32_t)(now - last_progress) < PROXY_CORE1_WATCHDOG_MS) {
+    return;
+  }
+
+  uint8_t const ph = g_core1_phase;
+  LOGF("[wdog] core 1 stalled %u ms in %s -- resetting\r\n",
+       (unsigned)(now - last_progress),
+       ph < (sizeof(kPhaseName) / sizeof(kPhaseName[0])) ? kPhaseName[ph] : "?");
+  LOGF("[wdog] PC->dev %lu sent / %lu dropped -- anything dropped was ACKed to "
+       "the PC as success\r\n",
+       (unsigned long)g_out_sent, (unsigned long)g_out_dropped);
+  // Push it out ourselves: the reboot is immediate and loop() will not get
+  // another chance to drain the ring.
+  for (uint8_t i = 0; i < 20 && !g_log_ring.empty(); i++) {
+    drain_log();
+    delay(5);
+  }
+  watchdog_reboot(0, 0, 0);
+}
+
 // The onboard LED on GPIO 13 means three things and only three:
 //
 //   dark     working normally, or simply nothing plugged into the host port
@@ -1140,11 +1338,15 @@ static bool core1_alive(void) {
 //
 // Faults are:
 //   - core 1 wedged, or the host stack never started
+//   - a PC->device report was dropped after we had already ACKed it
 //   - a key is attached but not all four interfaces matched
 //   - all four matched but the PC has not mounted the proxy
 static bool led_fault(void) {
   if (g_core1_fatal || !core1_alive()) {
     return true;
+  }
+  if (g_out_drop_flag) {
+    return true; // sticky until reset: the PC was told a lie and cannot be told
   }
   if (!g_power_is_on) {
     return false; // VBUS deliberately cut; nothing is expected to be up
@@ -1441,6 +1643,7 @@ void loop() {
   button_service();
   led_service();
   pixel_service(); // core 0 only: the sole place the pixel PIO is touched
+  core1_watchdog_service(); // last: it may not return
 }
 
 // --------------------------------------------------------------------------
@@ -1515,9 +1718,39 @@ static void link_service(void) {
 // SET_REPORT otherwise (keyboard LEDs) or for Feature reports. Both send paths
 // return false while busy, which doubles as the gate against overlapping
 // transfers: leave the report queued and retry next pass.
+// Core 1 only. Set after a HalfKay block-0 write; nothing is forwarded to that
+// interface until the chip erase it kicked off has had time to finish.
+static uint32_t g_out_hold_until[PROXY_MAX_HID];
+
+// Does this look like the HalfKay write that erases the chip? Only the
+// bootloader's own interface qualifies (known < 0 means no descriptor matched),
+// and only a firmware-sized block -- an ordinary report starting 00 00 00 is
+// commonplace and must not trigger a three-second stall. The reboot command is
+// FF FF FF, so it is never confused with this.
+static bool is_halfkay_erase_block(host_link_t const *link,
+                                   out_report_t const *rpt) {
+  return link->known < 0 && rpt->len > PROXY_SMALL_REPORT_MAX &&
+         rpt->data[0] == 0 && rpt->data[1] == 0 && rpt->data[2] == 0;
+}
+
 static void forward_out(void) {
   for (uint8_t i = 0; i < PROXY_MAX_HID; i++) {
     host_link_t const *link = &g_link[i];
+
+    // Still inside a chip-erase window: the device NAKs everything, so sending
+    // now only produces retries that hammer a busy bootloader. Abandoned
+    // immediately if the device goes away, so an unplug during the erase does
+    // not leave the queue frozen for three seconds.
+    if (g_out_hold_until[i]) {
+      if (!link->mounted) {
+        g_out_hold_until[i] = 0;
+      } else if ((int32_t)(millis() - g_out_hold_until[i]) < 0) {
+        continue;
+      } else {
+        g_out_hold_until[i] = 0;
+        LOGF("[out] slot %u erase window over, resuming\r\n", i);
+      }
+    }
 
     while (true) {
       out_report_t *rpt = g_outq[i].peek();
@@ -1529,20 +1762,8 @@ static void forward_out(void) {
         // Nothing to forward to -- discard rather than stall the queue.
         g_outq[i].pop();
         g_out_dropped++;
+        g_out_hold_until[i] = 0;
         continue;
-      }
-
-      // Log what we are about to forward: length, transport, and the first
-      // bytes -- enough to compare two hosts' packets byte-for-byte. HalfKay's
-      // reboot is 0xFF 0xFF 0xFF followed by zeros, so it is recognisable.
-      if (g_out_verbose) {
-        LOGF("[out] slot %u id=%u type=%u len=%u : %02X %02X %02X %02X "
-             "%02X %02X %02X %02X\r\n",
-             i, rpt->report_id, rpt->report_type, rpt->len,
-             rpt->len > 0 ? rpt->data[0] : 0, rpt->len > 1 ? rpt->data[1] : 0,
-             rpt->len > 2 ? rpt->data[2] : 0, rpt->len > 3 ? rpt->data[3] : 0,
-             rpt->len > 4 ? rpt->data[4] : 0, rpt->len > 5 ? rpt->data[5] : 0,
-             rpt->len > 6 ? rpt->data[6] : 0, rpt->len > 7 ? rpt->data[7] : 0);
       }
 
       bool ok;
@@ -1558,11 +1779,34 @@ static void forward_out(void) {
       }
 
       if (!ok) {
-        break;
+        break; // busy: leave it queued and retry on the next pass
       }
+
+      // Logged on success, not on attempt. Logging before the send re-printed
+      // the same report on every retry -- 490 lines for 210 delivered blocks --
+      // which made a capture almost unreadable and looked like duplicate
+      // traffic. One line here means exactly one report actually delivered.
+      if (g_out_verbose) {
+        LOGF("[out] slot %u id=%u type=%u len=%u : %02X %02X %02X %02X "
+             "%02X %02X %02X %02X\r\n",
+             i, rpt->report_id, rpt->report_type, rpt->len,
+             rpt->len > 0 ? rpt->data[0] : 0, rpt->len > 1 ? rpt->data[1] : 0,
+             rpt->len > 2 ? rpt->data[2] : 0, rpt->len > 3 ? rpt->data[3] : 0,
+             rpt->len > 4 ? rpt->data[4] : 0, rpt->len > 5 ? rpt->data[5] : 0,
+             rpt->len > 6 ? rpt->data[6] : 0, rpt->len > 7 ? rpt->data[7] : 0);
+      }
+
+      bool const erase = is_halfkay_erase_block(link, rpt);
       g_outq[i].pop();
       g_out_sent++;
       pixel_note_activity(i); // variable store only; core 0 does the rendering
+
+      if (erase) {
+        g_out_hold_until[i] = millis() + PROXY_HALFKAY_ERASE_MS;
+        LOGF("[out] slot %u block 0 sent, holding %u ms for chip erase\r\n", i,
+             (unsigned)PROXY_HALFKAY_ERASE_MS);
+        break; // nothing else may go out until the erase finishes
+      }
     }
   }
 }

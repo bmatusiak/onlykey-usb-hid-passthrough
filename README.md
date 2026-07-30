@@ -181,11 +181,16 @@ use, so it reads normally at runtime. It only means "bootloader" when held down
 The heartbeat matters because cutting VBUS also detaches us from the PC, so
 every other sign of life vanishes at the same moment.
 
-"Needs attention" means: core 1 wedged or the host stack never started; a key is
-attached but an interface failed to clone; or the PC has not mounted the proxy.
-A fault must persist 2 s before it lights (`PROXY_LED_FAULT_MS`) — enumeration
-and power cycles pass briefly through states that look faulty. A real fault
-outranks the heartbeat.
+"Needs attention" means: core 1 wedged or the host stack never started; a
+PC→device report was dropped after we had already ACKed it; a key is attached but
+an interface failed to clone; or the PC has not mounted the proxy. A fault must
+persist 2 s before it lights (`PROXY_LED_FAULT_MS`) — enumeration and power
+cycles pass briefly through states that look faulty. A real fault outranks the
+heartbeat.
+
+The dropped-report fault is **sticky until reset**, and deliberately so: the
+sender was told that data was delivered, and there is no way left to correct
+that. It must not scroll off the log. `i` says so too.
 
 ### NeoPixel (GPIO 21) — traffic
 
@@ -416,6 +421,74 @@ a full firmware flash at `PC->dev : 210 sent, 0 dropped`.
 If you touch the OUT path, check `PC->dev` after both a flash *and* a burst of
 raw-HID traffic. The two exercise opposite halves of this rule.
 
+The wait also gives up early if core 1 stops ticking. Spinning the full 250 ms
+per report for a core that has wedged just delays the watchdog, which needs core
+0 running in order to notice.
+
+### The core 1 watchdog
+
+Core 1 runs the host stack, so when it wedges `forward_out()` stops — but core 0
+keeps answering the PC perfectly. Every report then hits a queue nobody drains,
+gets dropped, and was *already ACKed*. The result is a flashing tool that writes
+all 210 blocks, reports success, sends its reboot, logs `IMG_REBOOT_OK`, and the
+key receives **none of it**.
+
+This was observed directly. The OnlyKey GUI appeared broken for days while the
+CLI worked; the difference turned out to be nothing about the two tools, but
+whether core 1 happened to be alive when the run started. Captured with the key
+in HalfKay and core 1 wedged:
+
+```
+core1     : STALLED, 64635450 ticks, last phase: USBHost.task
+PC->dev   : 212 sent, 164 dropped     <- and still climbing
+```
+
+The wedge itself is inside Pico-PIO-USB, which waits on PIO hardware flags with
+no timeout of its own:
+
+```c
+while ((pp->pio_usb_tx->irq & IRQ_TX_EOP_MASK) == 0) { continue; }
+while (!(pp->pio_usb_tx->fdebug & stall_mask))      { continue; }
+```
+
+Nothing in the library recovers from that, and core 0 cannot fix it from
+outside — core 1 is never coming back to be told anything, and its state
+machines and DMA channels are left mid-transfer. So if core 1 makes no progress
+for `PROXY_CORE1_WATCHDOG_MS` (3 s), core 0 resets the board.
+
+Resetting is the point. It converts silent corruption into an honest error: our
+device drops off the bus mid-transfer, so the tool fails loudly instead of
+lying. Descriptor dumps hold core 1 in synchronous transfers legitimately, so
+they disarm it.
+
+### The HalfKay chip-erase window
+
+Writing HalfKay's block 0 triggers a full chip erase taking seconds, during
+which the bootloader NAKs everything. `teensy_loader_cli` and
+`tools/halfkay_flash.py` both sleep 3 s there — but **a proxy cannot rely on the
+PC doing that**, because the PC is talking to us, not to the key.
+
+Measured with the OnlyKey GUI, which sends block 1 immediately:
+
+```
+block 0  x1
+block 1  x138 retries
+block 2  x181 retries     ~390 control transfers into a busy device
+block 3  x73  retries
+block 4  x1               erase done, clean from here on
+```
+
+The retry logic absorbed it and the flash still completed correctly, but that
+burst is the most plausible trigger for the PIO desync above. So the proxy now
+enforces the delay itself: after forwarding a block-0 write to a bootloader
+interface, nothing else goes out for `PROXY_HALFKAY_ERASE_MS`. Every flashing
+tool then behaves, whether or not it waits.
+
+Only the bootloader's own interface qualifies (`known < 0`) and only for
+firmware-sized reports — an ordinary 64-byte report beginning `00 00 00` is
+commonplace and must not stall the queue for three seconds. The reboot command
+is `FF FF FF`, so it is never mistaken for this.
+
 ### IN endpoint arming
 
 Interfaces are polled only after `PROXY_ARM_DELAY_MS` (500 ms), so a device that
@@ -552,11 +625,26 @@ Top of `src/main.cpp`.
 | `PROXY_MAX_HID` | `4` | Must be ≤ `CFG_TUD_HID` in `platformio.ini` |
 | `PROXY_PIXEL_BRIGHTNESS` | `40` | NeoPixel ceiling, 0–255 |
 | `PROXY_LED_FAULT_MS` | `2000` | How long a fault must persist before GPIO 13 lights |
+| `PROXY_CORE1_WATCHDOG_MS` | `3000` | Core 1 silence tolerated before core 0 resets the board |
+| `PROXY_HALFKAY_ERASE_MS` | `3000` | Hold-off after a HalfKay block-0 write, for the chip erase |
 | `PROXY_CUT_DATA_LINES` | `0` | Unproven experiment — **known to wedge the host stack** |
 
 ---
 
 ## Known issues
+
+**Entering the OnlyKey's bootloader invalidates its application firmware.** You
+must re-flash; there is no booting back out. `halfkay_flash.py --boot-only`
+returns the key to *HalfKay*, not to the application, because HalfKay has nothing
+valid to jump to. This is correct Teensy behaviour, but it looks exactly like a
+passthrough failure and has been misread as one more than once — including as
+apparent evidence against a fix that was working correctly. Any procedure that
+enters the bootloader must flash to get back.
+
+Flashing the **Feather** has the same consequence: the RP2040 reset drops VBUS
+and reverts GPIO 6 to input-with-pull-down, so the key restarts with its contact
+grounded and lands in the bootloader. Expect to re-flash the key after every
+proxy upload.
 
 **VBUS commands are not a true power cycle.** Cutting VBUS drops the key off
 the bus, but it does not make the key re-run its startup — bootloader entry by
@@ -571,16 +659,27 @@ unproven** — it also wedges Pico-PIO-USB, because releasing the pads mid-fligh
 stops the host stack servicing and the command that would restore power never
 runs. Doing it safely would need the PIO state machines stopped first.
 
-**Core 1 stalls — believed fixed.** Core 1 used to wedge whenever the key
-switched between application and bootloader mode. The phase instrumentation
-localised it to a call to `tuh_hid_itf_get_total_count()`, which walks the HID
-host driver's interface table from outside the normal task flow — while the
-driver was tearing those very entries down. It was only feeding a cosmetic
-counter, so the count is now derived from our own `g_link[]` and the driver's
-internals are left alone. A live application -> bootloader swap has since
-completed cleanly with core 1 still running.
+**Core 1 stalls — both causes now addressed.**
 
-If it ever recurs, `last phase:` in `i` names the step it died in.
+One cause was a call to `tuh_hid_itf_get_total_count()`, which walks the HID host
+driver's interface table from outside the normal task flow — while the driver was
+tearing those very entries down during an application ↔ bootloader swap. It only
+fed a cosmetic counter, so the count now comes from our own `g_link[]`.
+
+The other was inside Pico-PIO-USB: unbounded spins on PIO hardware flags, running
+in the **SOF alarm interrupt**. When a state machine desyncs — which a device
+detaching mid-transfer can cause — the flag never arrives, the SOF callback never
+returns, and everything waiting on it (`abort_transfer`, `pio_usb_host_stop`, the
+bus itself) hangs with it. The library is now vendored at `lib/Pico_PIO_USB/`
+with every such wait bounded; see `lib/Pico_PIO_USB/PATCHES.md`.
+
+`pio_usb_tx_timeouts` counts every give-up and appears in `i` and the `s` health
+line, so a silent recovery is still a reported one.
+
+The watchdog remains as a backstop. These are belt and braces, not alternatives:
+the patches remove the known hang, the watchdog covers the ones we have not met
+yet. Verified with `tools/soak.py`, which drives bootloader ↔ application cycles
+with a full flash each time.
 
 **GET_REPORT stalls.** The host-side get is asynchronous and the device-side
 callback must answer synchronously, so control-pipe `GET_REPORT` returns a
@@ -618,13 +717,31 @@ interface cannot be cloned.
 - **Live descriptor swap**: `b` reboots a running key into HalfKay and the proxy
   follows it in ~1 s with no reset, verified from the Windows device list
 - Power control by console and BOOT button; console-only re-enumeration
+- **The OnlyKey desktop GUI flashing and rebooting the key through the proxy** —
+  210 blocks, `PC->dev : 210 sent, 0 dropped`, reboot forwarded, key returns as
+  `1D50:60FC` with all four interfaces. GUI and CLI reboots captured side by side
+  and are byte-identical (`id=0 type=2 len=1088`, `FF FF FF 00…`)
+- **The erase hold-off** — retries across the chip-erase window went from ~390 to
+  zero, one log line per delivered report
+- **Repeated bootloader ↔ application cycling under `tools/soak.py`**, each cycle
+  a full 210-block flash, with `core1=ok`, `drops=0` and `piotimeouts=0` checked
+  after every one
 - Clean build under `-Wall -Wextra` across all three environments
 
-**Not verified — needs a human at the keyboard:**
+- **The PIO bounded waits catching a real desync.** During a 25-cycle soak the
+  counter went to `piotimeouts=1` on cycle 4 and that cycle still passed — the
+  bus desynced, the wait gave up, the transaction was abandoned and the stack
+  carried on. Under the original unbounded spin the same event hangs core 1
+  permanently. This is the failure that used to corrupt firmware flashes
+  silently.
 
-- **Keystrokes from the OnlyKey actually reaching the PC** (expect a white pulse)
+**Not yet verified:**
+
+- **The watchdog firing on a real wedge.** Still no wedge to hand — which is now
+  the point, since the known cause is fixed. It remains a backstop for hangs
+  that have not been met yet.
 - **A WebAuthn / FIDO2 login through the proxy** (expect yellow)
-- **The OnlyKey desktop app talking to the key** (expect green)
+- **Keystrokes from the OnlyKey reaching the PC** (expect a white pulse)
 
 Report counters prove bytes move; they cannot prove the host *interprets* them.
 

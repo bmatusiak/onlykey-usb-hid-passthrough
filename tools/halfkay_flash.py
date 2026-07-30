@@ -12,9 +12,25 @@ which is the same path the proxy forwards. For a Teensy 3.2 each block is a
     python halfkay_flash.py firmware.hex              # program then reboot
     python halfkay_flash.py --boot-only               # just reboot the key
     python halfkay_flash.py firmware.hex --no-reboot  # leave it in bootloader
+    python halfkay_flash.py firmware.hex --no-health  # skip proxy monitoring
 
 Defaults target the OnlyKey's MK20DX256 (Teensy 3.2). Override with --code-size
 and --block-size for other parts.
+
+Fail-fast
+---------
+When flashing THROUGH the Feather proxy, a successful HidD_SetOutputReport
+proves nothing. The proxy ACKs the control transfer before it knows whether the
+report can be forwarded, so if its host core has wedged, every write "succeeds"
+and the key receives nothing. That is not hypothetical -- it is how a run
+reported 210 blocks and IMG_REBOOT_OK while writing a corrupt image.
+
+So this tool watches the proxy's own health line over the serial console and
+ABORTS THE INSTANT anything is dropped, rather than finishing and reporting a
+success it cannot substantiate. The console is found automatically; pass
+--console to override or --no-health to flash a directly-attached key.
+
+Exit codes: 0 success, 1 flash error, 2 proxy fault (data was lost).
 """
 
 import argparse
@@ -160,6 +176,133 @@ def find_device(vid, pid):
         setupapi.SetupDiDestroyDeviceInfoList(dev_info)
 
 
+# --------------------------------------------------------- proxy health ----
+
+class ProxyFault(Exception):
+    """The proxy lost data, or stopped being able to forward it."""
+
+
+class ProxyHealth:
+    """Reads the Feather proxy's `s` health line over its serial console.
+
+    Optional by design: with --no-health, or when no console is found, this
+    degrades to a no-op so the tool still works against a directly-attached
+    key. But when the proxy IS in the path, its health is the only real
+    evidence a write landed -- the HID call cannot tell us.
+    """
+
+    def __init__(self, port=None):
+        self.ser = None
+        self.port = port
+        self.lost = False
+        # Set once a reboot has been sent. After that the console is EXPECTED to
+        # disappear -- rebooting the key re-enumerates the proxy along with it --
+        # so losing the port stops being evidence of a fault and becomes
+        # evidence the reboot landed. Before that point, a vanished console
+        # means the proxy reset under us, which is very much a fault.
+        self.expect_loss = False
+        if port is None:
+            return
+        try:
+            import serial  # imported lazily: only needed for proxy runs
+        except ImportError:
+            print("WARNING: pyserial not installed -- proxy health unmonitored")
+            return
+        try:
+            self.ser = serial.Serial(port, 115200, timeout=0.05)
+        except Exception as exc:
+            print("WARNING: could not open %s (%s) -- health unmonitored"
+                  % (port, exc))
+
+    @property
+    def active(self):
+        return self.ser is not None
+
+    def _command(self, key, wait=0.5):
+        try:
+            self.ser.reset_input_buffer()
+            self.ser.write(key.encode())
+            self.ser.flush()
+            out = b""
+            end = time.time() + wait
+            while time.time() < end:
+                out += self.ser.read(4096)
+            return out.decode("utf-8", "replace")
+        except Exception:
+            # The port went away mid-command. Whether that is good or bad is
+            # decided in check(); just record it and stop touching the handle.
+            self.lost = True
+            self.close()
+            return ""
+
+    def read(self):
+        """Return the health line as a dict, or None if it could not be read."""
+        if not self.ser:
+            return None
+        for _ in range(3):
+            for line in self._command("s").splitlines():
+                if "[health]" in line:
+                    fields = {}
+                    for token in line.split("[health]", 1)[1].split():
+                        if "=" in token:
+                            k, v = token.split("=", 1)
+                            fields[k] = v
+                    if fields:
+                        return fields
+        return None
+
+    def zero(self):
+        if self.ser:
+            self._command("z")
+
+    def check(self, context):
+        """Raise ProxyFault if the proxy has lost anything. Cheap; call often."""
+        health = self.read()
+        if self.lost and not self.expect_loss:
+            raise ProxyFault(
+                "%s: the proxy console disappeared mid-flash -- the board reset "
+                "under us (watchdog?), so the rest of this image never landed"
+                % context)
+        if health is None:
+            return None
+        if health.get("dropflag") == "1" or health.get("drops", "0") != "0":
+            raise ProxyFault(
+                "%s: proxy DROPPED %s report(s) after ACKing them to us -- "
+                "the key did not receive them, so this image is corrupt"
+                % (context, health.get("drops", "?")))
+        if health.get("core1") != "ok":
+            raise ProxyFault(
+                "%s: proxy host core is %s -- nothing is reaching the key"
+                % (context, health.get("core1")))
+        return health
+
+    def close(self):
+        if self.ser:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+            self.ser = None
+
+
+def find_proxy_console(vid, pid):
+    """Find the CDC console belonging to the proxy cloning this VID/PID.
+
+    The proxy adopts the attached key's IDs, so its console shows up as a USB
+    Serial Device under the same VID/PID as the HID interface we are flashing.
+    A real key has no such console, which is exactly how we tell the two apart.
+    """
+    try:
+        from serial.tools import list_ports
+    except ImportError:
+        return None
+    want = "VID:PID=%04X:%04X" % (vid, pid)
+    for port in list_ports.comports():
+        if want in (port.hwid or "").upper():
+            return port.device
+    return None
+
+
 # ------------------------------------------------------------ Intel HEX ----
 
 def read_intel_hex(path, code_size):
@@ -210,6 +353,11 @@ def main():
     ap.add_argument("--block-size", type=int, default=1024)
     ap.add_argument("--boot-only", action="store_true")
     ap.add_argument("--no-reboot", action="store_true")
+    ap.add_argument("--console", help="proxy console port, e.g. COM15")
+    ap.add_argument("--no-health", action="store_true",
+                    help="do not monitor the proxy (direct-attached key)")
+    ap.add_argument("--check-every", type=int, default=16,
+                    help="blocks between proxy health checks (0 = only at end)")
     args = ap.parse_args()
 
     if not args.hexfile and not args.boot_only:
@@ -221,6 +369,16 @@ def main():
               % (args.vid, args.pid))
         return 1
 
+    console = None
+    if not args.no_health:
+        console = args.console or find_proxy_console(args.vid, args.pid)
+        if console:
+            print("proxy console on %s -- will abort on any dropped report"
+                  % console)
+        else:
+            print("no proxy console found; assuming a directly-attached key")
+    health = ProxyHealth(console)
+
     # 3 address bytes + 61 pad + block, matching teensy_loader_cli for
     # block_size 512/1024.
     write_size = args.block_size + 64
@@ -231,11 +389,28 @@ def main():
         out_len = write_size + 1
 
     try:
+        # Pre-flight. Refusing to start against a wedged proxy is the whole
+        # point: a run that begins here can be trusted to mean something.
+        if health.active:
+            before = health.read()
+            if before is None:
+                print("WARNING: proxy console gave no health line -- unmonitored")
+            elif before.get("core1") != "ok":
+                print("ABORT: proxy host core is %s before we even started"
+                      % before.get("core1"))
+                return 2
+            else:
+                health.zero()
+
         if args.boot_only:
             payload = bytearray(write_size)
             payload[0] = payload[1] = payload[2] = 0xFF
-            print("rebooting..." if write_report(handle, payload, out_len)
-                  else "reboot write FAILED")
+            health.expect_loss = True  # the key is about to take the console
+            if not write_report(handle, payload, out_len):
+                print("reboot write FAILED")
+                return 1
+            print("rebooting...")
+            health.check("reboot")
             return 0
 
         mem, used = read_intel_hex(args.hexfile, args.code_size)
@@ -263,7 +438,9 @@ def main():
                       % (addr, blocks, err))
                 return 1
 
-            # The first write erases the chip and takes far longer than the rest.
+            # The first write erases the chip and takes far longer than the
+            # rest. The proxy enforces this delay too, since it cannot rely on
+            # the PC doing so -- but keep it here for directly-attached keys.
             if blocks == 0:
                 time.sleep(3.0)
             blocks += 1
@@ -271,17 +448,38 @@ def main():
                 sys.stdout.write(".")
                 sys.stdout.flush()
 
+            # Stop AT the failure, not after it. Finishing the remaining blocks
+            # would only produce a longer, more convincing lie.
+            if args.check_every and blocks % args.check_every == 0:
+                health.check("block %d (0x%06X)" % (blocks, addr))
+
         elapsed = time.time() - started
+        health.check("end of image")
         print("\nprogrammed %d blocks (%d bytes) in %.2f s"
               % (blocks, blocks * args.block_size, elapsed))
+
+        # Last chance to see clean counters while the console is still there.
+        if health.active:
+            final = health.read()
+            if final:
+                print("proxy: %s sent, %s dropped"
+                      % (final.get("sent", "?"), final.get("drops", "?")))
 
         if not args.no_reboot:
             payload = bytearray(write_size)
             payload[0] = payload[1] = payload[2] = 0xFF
-            write_report(handle, payload, out_len)
+            health.expect_loss = True  # rebooting takes the console with it
+            if not write_report(handle, payload, out_len):
+                print("reboot write FAILED")
+                return 1
+            health.check("reboot")
             print("reboot sent")
         return 0
+    except ProxyFault as fault:
+        print("\nABORT: %s" % fault)
+        return 2
     finally:
+        health.close()
         kernel32.CloseHandle(handle)
 
 
