@@ -62,7 +62,11 @@ public:
   uint32_t dropped() const { return dropped_; }
 
 private:
-  static const uint16_t kSize = 4096;
+  // Generous on purpose: with -DCFG_TUSB_DEBUG the TinyUSB trace alone runs at
+  // roughly 29 KB/s, which at 4 KB evicted our own [host] lines before they
+  // could be drained -- mount/unmount events went missing exactly when they
+  // mattered. Prefer dropping trace noise over dropping our own messages.
+  static const uint16_t kSize = 16384;
   volatile uint16_t head_ = 0;
   volatile uint16_t tail_ = 0;
   volatile uint32_t dropped_ = 0;

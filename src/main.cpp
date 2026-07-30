@@ -93,12 +93,52 @@
 // A device's HID interfaces mount one at a time. Wait for the arrivals to stop
 // before presenting ourselves to the PC, so it enumerates us once, not four
 // times.
-#define PROXY_SETTLE_MS 150
+#define PROXY_SETTLE_MS 500
+
+// GPIO wired to the OnlyKey's bootloader contact, which triggers when pulled to
+// ground. Ground is already shared through the Type-A connector, so this needs
+// one wire.
+//
+#define PROXY_BOOTSEL_PIN 6
+
+// How the pin reaches that contact:
+//
+//  1 = through an N-channel MOSFET / NPN (gate or base on this pin, drain or
+//      collector on the contact, source or emitter to ground). Drive HIGH to
+//      press. STRONGLY PREFERRED: RP2040 pads come out of reset as inputs with
+//      a pull-DOWN, which holds the transistor off, so the contact reads
+//      released during reset and while the RP2040 bootloader runs -- a window
+//      no firmware can cover. It also keeps the Feather's pin off the
+//      OnlyKey's button line entirely, so nothing can back-feed the key while
+//      it is unpowered.
+//
+//  0 = wired straight to the contact. Driven open-drain only: output-low to
+//      press, high-Z to release, never driven high. Works, but that same
+//      reset-time pull-down sits on the contact and can read as a stuck press
+//      -- which is exactly what stopped the key enumerating once wired this
+//      way.
+#ifndef PROXY_BOOTSEL_ACTIVE_HIGH
+#define PROXY_BOOTSEL_ACTIVE_HIGH 1
+#endif
+
+// How long to hold the contact. A brief tap is all a Teensy-style program
+// button needs; the value is generous because holding longer is harmless.
+#define PROXY_BOOTSEL_HOLD_MS 300
+
+// Grace period between an interface mounting and us first asking it for a
+// report. A device that has only just enumerated may still be initialising --
+// notably the OnlyKey coming up in bootloader mode -- and polling it the
+// instant it appears is a good way to upset it. Nothing is lost by waiting:
+// the device buffers nothing until we ask.
+#define PROXY_ARM_DELAY_MS 500
 
 // Ring depth per interface. IN is device->PC (bursty: CTAPHID sends 64-byte
 // continuation frames back to back), OUT is PC->device.
 #define PROXY_IN_QUEUE_LEN 16
-#define PROXY_OUT_QUEUE_LEN 8
+// Shallower than the IN queue on purpose: each slot is now PROXY_MAX_OUT_REPORT
+// bytes to accommodate firmware blocks, so depth costs real RAM. Host-to-device
+// traffic is request/response and never bursts the way input reports do.
+#define PROXY_OUT_QUEUE_LEN 4
 
 #define PROXY_MAX_HID 4
 static_assert(PROXY_MAX_HID <= CFG_TUD_HID,
@@ -178,17 +218,16 @@ struct proxy_itf_desc_t {
   uint16_t desc_len;
   uint8_t sig_len; // leading bytes that identify this interface
   uint8_t boot_protocol;
-  uint8_t interval_ms;
 };
 
 // Order defines the interface order the PC sees. Keyboard first, matching the
 // OnlyKey's own layout.
 static proxy_itf_desc_t const k_itf[PROXY_MAX_HID] = {
     {"keyboard", desc_keyboard, sizeof(desc_keyboard), 4,
-     HID_ITF_PROTOCOL_KEYBOARD, 1},
-    {"fido2", desc_fido, sizeof(desc_fido), 5, HID_ITF_PROTOCOL_NONE, 1},
-    {"rawhid", desc_rawhid, sizeof(desc_rawhid), 5, HID_ITF_PROTOCOL_NONE, 1},
-    {"seremu", desc_seremu, sizeof(desc_seremu), 5, HID_ITF_PROTOCOL_NONE, 1},
+     HID_ITF_PROTOCOL_KEYBOARD},
+    {"fido2", desc_fido, sizeof(desc_fido), 5, HID_ITF_PROTOCOL_NONE},
+    {"rawhid", desc_rawhid, sizeof(desc_rawhid), 5, HID_ITF_PROTOCOL_NONE},
+    {"seremu", desc_seremu, sizeof(desc_seremu), 5, HID_ITF_PROTOCOL_NONE},
 };
 
 // --------------------------------------------------------------------------
@@ -205,13 +244,35 @@ Adafruit_USBH_Host USBHost;
 
 // Maps one of our four interfaces onto the host-side HID instance serving it.
 // Written by core 1; core 0 reads `mounted` for status output only.
+// Report descriptors are captured from the attached device rather than assumed,
+// so anything that enumerates gets proxied -- including the OnlyKey's bootloader,
+// whose descriptors are different and not known in advance. The compiled-in
+// table is used only to *name* and colour the familiar interfaces.
+//
+// 256 is not arbitrary: it is CFG_TUH_ENUMERATION_BUFSIZE. TinyUSB does not
+// deliver report descriptors larger than that, so nothing bigger can arrive.
+#define PROXY_MAX_DESC_LEN 256
+
 struct host_link_t {
   volatile bool mounted;
   uint8_t daddr;
   uint8_t idx;
   bool has_out_ep; // interrupt OUT available, else fall back to control
+  int8_t known;    // index into k_itf, or -1 for an unrecognised interface
+  uint16_t desc_len;
+  uint8_t desc[PROXY_MAX_DESC_LEN];
+  uint32_t mounted_at; // millis() when the interface appeared
+  bool armed;          // IN endpoint requested yet? see arm_service()
+  uint32_t in_count;   // reports received from this interface
+  uint32_t rearms;     // times the IN request chain had to be restarted
 };
 static host_link_t g_link[PROXY_MAX_HID];
+
+// Identity of whatever is currently attached, adopted so that bootloader mode
+// (a different VID/PID) is presented to the PC as the bootloader, not as the
+// application firmware. Falls back to the compiled-in IDs when nothing is up.
+static volatile uint16_t g_dev_vid = 0;
+static volatile uint16_t g_dev_pid = 0;
 
 // Presence mirroring. Core 1 decides whether a key is attached; core 0 owns the
 // device stack and is the only core allowed to call detach()/attach().
@@ -260,11 +321,18 @@ struct in_report_t {
   uint8_t data[CFG_TUH_HID_EPIN_BUFSIZE];
 };
 
+// Big enough for the OnlyKey's HalfKay bootloader, which writes firmware in
+// 1089-byte SET_REPORTs (1 report-ID byte + a 64-byte header + a 1024-byte
+// block). Ordinary HID reports are 64 bytes; this is sized for the worst case
+// because a truncated firmware block would be far worse than the wasted RAM.
+// Note len must be 16-bit -- 1089 does not fit in a uint8_t.
+#define PROXY_MAX_OUT_REPORT 1152
+
 struct out_report_t {
   uint8_t report_id;
   uint8_t report_type;
-  uint8_t len;
-  uint8_t data[CFG_TUH_HID_EPOUT_BUFSIZE];
+  uint16_t len;
+  uint8_t data[PROXY_MAX_OUT_REPORT];
 };
 
 // device -> PC: produced by core 1, consumed by core 0.
@@ -299,6 +367,27 @@ static uint32_t g_power_off_until;   // core 1 only
 // "host stack running, no device found" apart from "core 1 wedged", which
 // otherwise look identical from the outside.
 static volatile uint32_t g_core1_ticks;
+
+// Which step of loop1() core 1 entered last. When it wedges, this says where --
+// otherwise a stall is just a frozen counter with no indication of the cause.
+enum core1_phase_t : uint8_t {
+  C1_IDLE = 0,
+  C1_HOST_TASK,
+  C1_POWER,
+  C1_LINK,
+  C1_DUMP,
+  C1_POLL,
+  C1_FORWARD_OUT,
+  C1_MOUNT_CB,
+  C1_UMOUNT_CB,
+  C1_REPORT_CB,
+};
+static volatile uint8_t g_core1_phase = C1_IDLE;
+static char const *const kPhaseName[] = {
+    "idle",      "USBHost.task", "power_service", "link_service",
+    "dump",      "poll_count",   "forward_out",   "mount_cb",
+    "umount_cb", "report_cb",
+};
 // Set by core 1 if it cannot start the host stack at all.
 static volatile bool g_core1_fatal;
 
@@ -342,7 +431,47 @@ static void pc_present_set(bool present) {
   g_pc_present_req = present;
 }
 
+// Cutting VBUS alone does not actually de-power the attached device. PIO keeps
+// driving D+/D-, and current flows through the device's ESD clamp diodes into
+// its own supply rail -- "phantom power". The attached key stays lit and never
+// truly resets.
+//
+// Taking the pads away from PIO and holding them low removes that path, which
+// is also what a genuinely disconnected bus looks like (SE0). It is OFF by
+// default: releasing the pads mid-flight wedges Pico-PIO-USB, so the host stack
+// stops servicing and the command that would restore power never runs, leaving
+// the board reachable only via a manual reset. Kept rather than deleted because
+// the underlying effect is real -- doing it safely needs the PIO state machines
+// stopped first, which is unfinished work.
+#ifndef PROXY_CUT_DATA_LINES
+#define PROXY_CUT_DATA_LINES 0
+#endif
+
+#if PROXY_CUT_DATA_LINES
+static void host_pins_release(void) {
+  gpio_set_function(PIN_USB_HOST_DP, GPIO_FUNC_SIO);
+  gpio_set_function(PIN_USB_HOST_DP + 1, GPIO_FUNC_SIO);
+  gpio_set_dir(PIN_USB_HOST_DP, GPIO_OUT);
+  gpio_set_dir(PIN_USB_HOST_DP + 1, GPIO_OUT);
+  gpio_put(PIN_USB_HOST_DP, 0);
+  gpio_put(PIN_USB_HOST_DP + 1, 0);
+}
+
+// Hand the pads back to Pico-PIO-USB, which owns PIO0.
+static void host_pins_restore(void) {
+  gpio_set_function(PIN_USB_HOST_DP, GPIO_FUNC_PIO0);
+  gpio_set_function(PIN_USB_HOST_DP + 1, GPIO_FUNC_PIO0);
+}
+#endif // PROXY_CUT_DATA_LINES
+
 static void power_apply(bool on) {
+  if (on) {
+    // Restore the pads BEFORE raising VBUS, never after: if anything below
+    // wedges, the rail is already back and the board stays reachable.
+#if PROXY_CUT_DATA_LINES
+    host_pins_restore();
+#endif
+  }
   if (!on) {
     // Don't wait for the umount callbacks -- drop the PC side immediately so
     // the unplug it sees lines up with VBUS actually going away.
@@ -351,7 +480,11 @@ static void power_apply(bool on) {
     }
     g_link_settle_at = 0;
     pc_present_set(false);
+#if PROXY_CUT_DATA_LINES
+    host_pins_release(); // before VBUS drops, so no phantom-power window opens
+#endif
   }
+
   digitalWrite(PIN_5V_EN, on ? PIN_5V_EN_STATE : !PIN_5V_EN_STATE);
   g_power_is_on = on;
 }
@@ -421,7 +554,7 @@ static int8_t match_interface(uint8_t const *desc, uint16_t len) {
 // Print an unknown descriptor in the \xNN form used by the gadget script, so it
 // can be pasted straight into the table above.
 static void dump_descriptor(uint8_t const *desc, uint16_t len) {
-  LOGF("[map] unrecognised descriptor (%u bytes):\r\n\"", len);
+  LOGF("\"");
   for (uint16_t i = 0; i < len; i++) {
     LOGF("\\x%02X", desc[i]);
   }
@@ -450,7 +583,7 @@ static void set_report_thunk(uint8_t report_id, hid_report_type_t report_type,
   }
   slot->report_id = report_id;
   slot->report_type = (uint8_t)report_type;
-  slot->len = (uint8_t)bufsize;
+  slot->len = bufsize; // 16-bit: firmware blocks are far larger than 255 bytes
   memcpy(slot->data, buffer, bufsize);
   g_outq[ITF].commit();
 }
@@ -468,9 +601,12 @@ static bool core1_alive(void); // defined with the LED code below
 
 static void print_status(void) {
   LOGF("---- proxy status ----\r\n");
-  LOGF("core1     : %s, %lu ticks\r\n",
+  uint8_t const ph = g_core1_phase;
+  LOGF("core1     : %s, %lu ticks, last phase: %s\r\n",
        g_core1_fatal ? "FATAL" : (core1_alive() ? "running" : "STALLED"),
-       (unsigned long)g_core1_ticks);
+       (unsigned long)g_core1_ticks,
+       ph < (sizeof(kPhaseName) / sizeof(kPhaseName[0])) ? kPhaseName[ph]
+                                                        : "?");
   LOGF("host stack: %s, %u HID itf bound\r\n",
        g_host_started ? "started" : "NOT STARTED", g_host_hid_count);
   LOGF("VBUS      : %s (GPIO%u reads %u)\r\n", g_power_is_on ? "on" : "off",
@@ -489,9 +625,17 @@ static void print_status(void) {
                                  ? (TinyUSBDevice.mounted() ? "mounted"
                                                             : "attached")
                                  : "detached");
+  LOGF("attached  : %04X:%04X\r\n", g_dev_vid, g_dev_pid);
   for (uint8_t i = 0; i < PROXY_MAX_HID; i++) {
-    LOGF("itf %u %-8s: %s\r\n", i, k_itf[i].name,
-         g_link[i].mounted ? "linked" : "-");
+    host_link_t const *l = &g_link[i];
+    if (!l->mounted) {
+      LOGF("slot %u    : -\r\n", i);
+      continue;
+    }
+    LOGF("slot %u    : %s, %u-byte desc, OUT ep %s, %lu in, %lu rearm\r\n", i,
+         l->known >= 0 ? k_itf[l->known].name : "UNKNOWN (bootloader?)",
+         l->desc_len, l->has_out_ep ? "yes" : "no",
+         (unsigned long)l->in_count, (unsigned long)l->rearms);
   }
   LOGF("dev->PC   : %lu sent, %lu dropped\r\n", (unsigned long)g_in_sent,
        (unsigned long)g_in_dropped);
@@ -511,9 +655,91 @@ static void print_status(void) {
 // stays quiet and command output is easy to read.
 static bool g_heartbeat = false;
 
+// --------------------------------------------------------------------------
+// OnlyKey bootloader contact (core 0 only)
+// --------------------------------------------------------------------------
+
+static uint32_t g_bootsel_until = 0; // 0 = released
+
+// Also the power-on state, so a reset never leaves the contact held.
+static void bootsel_release(void) {
+#if PROXY_BOOTSEL_ACTIVE_HIGH
+  // Drive low: transistor off, contact floats. Driven rather than left as an
+  // input so the line cannot be nudged by noise on a long lead.
+  pinMode(PROXY_BOOTSEL_PIN, OUTPUT);
+  digitalWrite(PROXY_BOOTSEL_PIN, LOW);
+#else
+  pinMode(PROXY_BOOTSEL_PIN, INPUT); // high-Z; never drive this pin high
+#endif
+}
+
+static void bootsel_assert(void) {
+  pinMode(PROXY_BOOTSEL_PIN, OUTPUT);
+#if PROXY_BOOTSEL_ACTIVE_HIGH
+  digitalWrite(PROXY_BOOTSEL_PIN, HIGH); // turn the transistor on
+#else
+  digitalWrite(PROXY_BOOTSEL_PIN, LOW); // pull the contact to ground directly
+#endif
+}
+
+// If a key boots with no usable application firmware it may not enumerate at
+// all -- no descriptor, nothing on the bus, indistinguishable from an empty
+// port. Poking the bootloader contact can still drop it into the bootloader,
+// which does enumerate, and from there it can be reflashed. So when the port
+// stays silent for a while, try the contact before giving up.
+#ifndef PROXY_BOOTSEL_AUTO
+#define PROXY_BOOTSEL_AUTO 1
+#endif
+#define PROXY_BOOTSEL_AUTO_MS 6000 // silence this long before trying
+#define PROXY_BOOTSEL_AUTO_MAX 3   // then stop, rather than poking forever
+
+static void bootsel_service(void) {
+  if (g_bootsel_until && (int32_t)(millis() - g_bootsel_until) >= 0) {
+    g_bootsel_until = 0;
+    bootsel_release();
+    LOGF("[bsel] contact released\r\n");
+  }
+
+#if PROXY_BOOTSEL_AUTO
+  static uint32_t idle_since = 0;
+  static uint8_t attempts = 0;
+
+  bool linked = false;
+  for (uint8_t i = 0; i < PROXY_MAX_HID; i++) {
+    linked = linked || g_link[i].mounted;
+  }
+
+  // A live device, or no power, means there is nothing to recover from.
+  if (linked || !g_power_is_on) {
+    idle_since = millis();
+    attempts = 0;
+    return;
+  }
+  if (g_bootsel_until) {
+    return; // already holding the contact
+  }
+  if (attempts >= PROXY_BOOTSEL_AUTO_MAX) {
+    return; // tried enough; leave it alone
+  }
+  if ((int32_t)(millis() - (idle_since + PROXY_BOOTSEL_AUTO_MS)) < 0) {
+    return;
+  }
+
+  attempts++;
+  idle_since = millis();
+  bootsel_assert();
+  g_bootsel_until = millis() + PROXY_BOOTSEL_HOLD_MS;
+  LOGF("[bsel] nothing enumerated in %u ms -- pulsing contact (%u/%u)\r\n",
+       (unsigned)PROXY_BOOTSEL_AUTO_MS, attempts,
+       (unsigned)PROXY_BOOTSEL_AUTO_MAX);
+#endif
+}
+
 static void print_help(void) {
-  LOGF("commands: i=status  h=host pins  d=descriptor dump  p=power-cycle  "
-       "0=VBUS off  1=VBUS on  t=toggle 3s heartbeat (%s)  ?=help\r\n",
+  LOGF("commands: i=status  h=host pins  b=tap bootloader contact  "
+       "B=hold it through a power cycle  x=stored report descriptors  "
+       "d=live descriptor dump  p=power-cycle  0=VBUS off  1=VBUS on  "
+       "t=toggle 3s heartbeat (%s)  ?=help\r\n",
        g_heartbeat ? "on" : "off");
 }
 
@@ -557,6 +783,39 @@ static void console_service(void) {
     case 'd':
     case 'D':
       g_dump_req = true; // core 1 performs it; sync APIs need loop1 context
+      break;
+    case 'b':
+      // Tap the contact on a running key. A Teensy-style program button reboots
+      // straight into the bootloader, no power cycle needed -- this is what
+      // happened when the button was pressed by hand on a live key.
+      bootsel_assert();
+      g_bootsel_until = millis() + PROXY_BOOTSEL_HOLD_MS;
+      LOGF("[bsel] contact held low for %u ms\r\n",
+           (unsigned)PROXY_BOOTSEL_HOLD_MS);
+      break;
+    case 'B':
+      // Hold the contact across a power cycle, mirroring "hold the button while
+      // plugging it in" for keys that only sample the button at startup.
+      bootsel_assert();
+      g_bootsel_until =
+          millis() + PROXY_POWER_OFF_MS + PROXY_BOOTSEL_HOLD_MS + 250;
+      g_power_cmd = PWR_CMD_CYCLE;
+      LOGF("[bsel] holding contact through a power cycle\r\n");
+      break;
+    case 'x':
+    case 'X':
+      // Re-print the descriptors captured at mount time. Needed because a mode
+      // change (application <-> bootloader) re-enumerates our device too, so
+      // the dump printed during the transition is lost with the console.
+      for (uint8_t i = 0; i < PROXY_MAX_HID; i++) {
+        host_link_t const *l = &g_link[i];
+        if (!l->mounted || !l->desc_len) {
+          continue;
+        }
+        LOGF("slot %u (%s), %u bytes:\r\n", i,
+             l->known >= 0 ? k_itf[l->known].name : "UNKNOWN", l->desc_len);
+        dump_descriptor(l->desc, l->desc_len);
+      }
       break;
     case '?':
       print_help();
@@ -651,19 +910,44 @@ static uint8_t const kItfRank[PROXY_MAX_HID] = {
     1, // seremu
 };
 
-static inline void pixel_note_activity(uint8_t itf) {
-  if (itf >= PROXY_MAX_HID) {
+// Rank a slot by what it turned out to be. Unknown interfaces -- the bootloader
+// -- rank highest: if firmware is being flashed, that is the only thing worth
+// looking at.
+static inline uint8_t slot_rank(uint8_t slot) {
+  int8_t const known = g_link[slot].known;
+  if (known < 0) {
+    return 3;
+  }
+  return kItfRank[known];
+}
+
+static inline void pixel_note_activity(uint8_t slot) {
+  if (slot >= PROXY_MAX_HID) {
     return;
   }
   uint32_t const now = millis();
   int8_t const cur = g_pixel_itf;
   if (cur >= 0 && cur < (int8_t)PROXY_MAX_HID &&
       (now - g_pixel_at) < PROXY_PIXEL_PULSE_MS &&
-      kItfRank[itf] < kItfRank[cur]) {
+      slot_rank(slot) < slot_rank((uint8_t)cur)) {
     return; // don't let debug chatter paint over something more interesting
   }
-  g_pixel_itf = (int8_t)itf;
+  g_pixel_itf = (int8_t)slot;
   g_pixel_at = now;
+}
+
+// Cheap full-saturation hue sweep, 0-1535 around the wheel.
+static void hue_to_rgb(uint16_t hue, uint8_t *r, uint8_t *g, uint8_t *b) {
+  uint8_t const phase = (uint8_t)(hue / 256) % 6;
+  uint8_t const step = (uint8_t)(hue % 256);
+  switch (phase) {
+  case 0: *r = 255; *g = step; *b = 0; break;
+  case 1: *r = (uint8_t)(255 - step); *g = 255; *b = 0; break;
+  case 2: *r = 0; *g = 255; *b = step; break;
+  case 3: *r = 0; *g = (uint8_t)(255 - step); *b = 255; break;
+  case 4: *r = step; *g = 0; *b = 255; break;
+  default: *r = 255; *g = 0; *b = (uint8_t)(255 - step); break;
+  }
 }
 
 static void pixel_begin(void) {
@@ -726,14 +1010,29 @@ static void pixel_service(void) {
   uint8_t r = 0, g = 0, b = 0;
 
   // Activity: fade from the interface colour back to dark.
-  int8_t const itf = g_pixel_itf;
+  int8_t const slot = g_pixel_itf;
   uint32_t const since = millis() - g_pixel_at;
-  if (itf >= 0 && itf < (int8_t)PROXY_MAX_HID && since < PROXY_PIXEL_PULSE_MS) {
+  if (slot >= 0 && slot < (int8_t)PROXY_MAX_HID &&
+      since < PROXY_PIXEL_PULSE_MS) {
     uint32_t const fade = 255 - (since * 255 / PROXY_PIXEL_PULSE_MS);
-    uint8_t const *c = kItfColour[itf];
-    r = (uint8_t)((c[0] * fade + r * (255 - fade)) / 255);
-    g = (uint8_t)((c[1] * fade + g * (255 - fade)) / 255);
-    b = (uint8_t)((c[2] * fade + b * (255 - fade)) / 255);
+
+    uint8_t cr, cg, cb;
+    int8_t const known = g_link[slot].known;
+    if (known >= 0) {
+      cr = kItfColour[known][0];
+      cg = kItfColour[known][1];
+      cb = kItfColour[known][2];
+    } else {
+      // Unrecognised interface -- the bootloader. Cycle the hue continuously so
+      // firmware traffic is unmistakable against the fixed colours above.
+      static uint16_t hue = 0;
+      hue = (uint16_t)((hue + 37) % 1536);
+      hue_to_rgb(hue, &cr, &cg, &cb);
+    }
+
+    r = (uint8_t)((cr * fade + r * (255 - fade)) / 255);
+    g = (uint8_t)((cg * fade + g * (255 - fade)) / 255);
+    b = (uint8_t)((cb * fade + b * (255 - fade)) / 255);
   }
 
   pixel_put((uint8_t)(r * PROXY_PIXEL_BRIGHTNESS / 255),
@@ -850,6 +1149,7 @@ void setup() {
   pinMode(PIN_LED, OUTPUT);
   pinMode(PIN_BUTTON, INPUT_PULLUP);
   pixel_begin(); // core 0 only -- see the note above pixel_service()
+  bootsel_release(); // high-Z before anything else can drive it
 
   // Deliberately no wait for the port to be opened, and no keypress gate. Both
   // depended on tud_cdc_connected(), i.e. on the host asserting DTR, which made
@@ -870,20 +1170,18 @@ void setup() {
   delay(10);
 
   for (uint8_t i = 0; i < PROXY_MAX_HID; i++) {
-    g_hid[i].setReportDescriptor(k_itf[i].desc, k_itf[i].desc_len);
-    g_hid[i].setBootProtocol(k_itf[i].boot_protocol);
-    g_hid[i].setPollInterval(k_itf[i].interval_ms);
-    // Every one of these descriptors declares an Output item, so each needs an
-    // interrupt OUT endpoint -- CTAPHID and the OnlyKey app both rely on it.
-    g_hid[i].enableOutEndpoint(true);
     g_hid[i].setReportCallback(nullptr, k_set_cb[i]);
+    // Placeholder only, so begin() below builds a well-formed descriptor. The
+    // real report descriptor is captured from the attached device and installed
+    // by usb_build_config() on every rebuild.
+    g_hid[i].setReportDescriptor(k_itf[0].desc, k_itf[0].desc_len);
 
     // begin() once, purely to claim this object's HID instance index; the
     // configuration it appends to here is thrown away immediately below. Every
     // later rebuild goes through addInterface(), because begin() would
     // early-return now that the instance is valid.
     if (!g_hid[i].begin()) {
-      LOGF("[dev] FAILED to claim HID instance %u (%s)\r\n", i, k_itf[i].name);
+      LOGF("[dev] FAILED to claim HID instance %u\r\n", i);
     }
   }
 
@@ -919,7 +1217,13 @@ void setup() {
 // a freshly cleared configuration.
 static void usb_build_config(bool with_hid) {
   TinyUSBDevice.clearConfiguration();
-  TinyUSBDevice.setID(PROXY_VID, PROXY_PID);
+
+  // Adopt whatever is attached, so bootloader mode is presented to the PC as
+  // the bootloader. A flashing tool matches on VID/PID; showing the application
+  // firmware's IDs while the key is in its bootloader would make it invisible.
+  uint16_t const vid = g_dev_vid ? g_dev_vid : PROXY_VID;
+  uint16_t const pid = g_dev_pid ? g_dev_pid : PROXY_PID;
+  TinyUSBDevice.setID(vid, pid);
   TinyUSBDevice.setManufacturerDescriptor(PROXY_MANUFACTURER);
   TinyUSBDevice.setProductDescriptor(PROXY_PRODUCT);
   TinyUSBDevice.setSerialDescriptor(PROXY_SERIAL);
@@ -928,11 +1232,25 @@ static void usb_build_config(bool with_hid) {
   TinyUSBDevice.addInterface(Serial); // console first, so it keeps MI_00/01
 #endif
 
-  if (with_hid) {
-    for (uint8_t i = 0; i < PROXY_MAX_HID; i++) {
-      if (!TinyUSBDevice.addInterface(g_hid[i])) {
-        LOGF("[dev] FAILED to add interface %u (%s)\r\n", i, k_itf[i].name);
-      }
+  if (!with_hid) {
+    return;
+  }
+
+  // Mirror exactly the interfaces that are live, using the descriptors captured
+  // from the device. Slots are contiguous from 0, so stop at the first gap.
+  for (uint8_t i = 0; i < PROXY_MAX_HID; i++) {
+    host_link_t const *link = &g_link[i];
+    if (!link->mounted || !link->desc_len) {
+      continue;
+    }
+    g_hid[i].setReportDescriptor(link->desc, link->desc_len);
+    g_hid[i].setBootProtocol(link->known >= 0 ? k_itf[link->known].boot_protocol
+                                              : HID_ITF_PROTOCOL_NONE);
+    g_hid[i].setPollInterval(1);
+    // Mirror the device: only offer an interrupt OUT endpoint if it has one.
+    g_hid[i].enableOutEndpoint(link->has_out_ep);
+    if (!TinyUSBDevice.addInterface(g_hid[i])) {
+      LOGF("[dev] FAILED to add HID interface %u\r\n", i);
     }
   }
 }
@@ -1007,8 +1325,21 @@ void loop() {
     LOGF("\r\n######## diag cycle @ %lu ms ########\r\n",
          (unsigned long)millis());
     print_status();
-    LOGF("[diag] forcing re-enumeration...\r\n");
-    g_power_cmd = PWR_CMD_CYCLE;
+
+    // Only force a re-enumeration when nothing is linked. Power-cycling a
+    // device that is already up would be actively destructive here: it drops
+    // the OnlyKey out of bootloader mode, which is exactly the state we need to
+    // hold still while diagnosing.
+    bool linked = false;
+    for (uint8_t i = 0; i < PROXY_MAX_HID; i++) {
+      linked = linked || g_link[i].mounted;
+    }
+    if (linked) {
+      LOGF("[diag] device linked -- not power-cycling\r\n");
+    } else {
+      LOGF("[diag] nothing linked, forcing re-enumeration...\r\n");
+      g_power_cmd = PWR_CMD_CYCLE;
+    }
   }
 
   static uint32_t next_beat = 0;
@@ -1022,6 +1353,7 @@ void loop() {
 #endif
 
   drain_log();
+  bootsel_service();
   console_service();
   button_service();
   led_service();
@@ -1031,6 +1363,40 @@ void loop() {
 // --------------------------------------------------------------------------
 // Core 1 -- PIO USB host stack
 // --------------------------------------------------------------------------
+
+// Core 1: start polling an interface only once it has had time to settle after
+// enumerating. Kept out of the mount callback on purpose -- issuing the first IN
+// request from inside the callback hits the device at its busiest moment.
+static void arm_service(void) {
+  for (uint8_t i = 0; i < PROXY_MAX_HID; i++) {
+    host_link_t *link = &g_link[i];
+    if (!link->mounted) {
+      continue;
+    }
+    if ((int32_t)(millis() - (link->mounted_at + PROXY_ARM_DELAY_MS)) < 0) {
+      continue; // still settling after enumeration
+    }
+
+    // Keep a request outstanding at all times rather than arming once. An
+    // earlier version armed a single time per mount and relied on the report
+    // callback to re-arm; a single failed re-arm then silenced that interface
+    // permanently, which is exactly what stalled forwarding after a few hundred
+    // reports. receive_ready() is false while a request is already pending, so
+    // this only re-issues when the chain has actually been broken.
+    if (!tuh_hid_receive_ready(link->daddr, link->idx)) {
+      continue;
+    }
+    if (tuh_hid_receive_report(link->daddr, link->idx)) {
+      if (!link->armed) {
+        link->armed = true;
+        LOGF("[host] slot %u armed after %u ms\r\n", i,
+             (unsigned)PROXY_ARM_DELAY_MS);
+      } else {
+        link->rearms++;
+      }
+    }
+  }
+}
 
 // Once mounts/umounts have stopped arriving, publish presence to core 0.
 static void link_service(void) {
@@ -1248,10 +1614,15 @@ void setup1() {
 
 void loop1() {
   g_core1_ticks++; // liveness, watched by core 0
+  g_core1_phase = C1_HOST_TASK;
   USBHost.task();
+  g_core1_phase = C1_POWER;
   power_service();
+  g_core1_phase = C1_LINK;
+  arm_service();
   link_service();
 
+  g_core1_phase = C1_DUMP;
   if (g_dump_req) {
     g_dump_req = false;
     uint8_t const daddr = g_dev_addr;
@@ -1264,13 +1635,16 @@ void loop1() {
 
   // Publish what the HID host driver has actually bound, so core 0 can report
   // it without touching tuh_*.
+  g_core1_phase = C1_POLL;
   static uint32_t next_poll = 0;
   if ((int32_t)(millis() - next_poll) >= 0) {
     next_poll = millis() + 250;
     g_host_hid_count = tuh_hid_itf_get_total_count();
   }
+  g_core1_phase = C1_IDLE;
 
 #if !PROXY_DIAG
+  g_core1_phase = C1_FORWARD_OUT;
   forward_out();
 #endif
 }
@@ -1300,6 +1674,7 @@ void tuh_umount_cb(uint8_t daddr) {
 
 void tuh_hid_mount_cb(uint8_t daddr, uint8_t idx, uint8_t const *desc_report,
                       uint16_t desc_len) {
+  g_core1_phase = C1_MOUNT_CB;
   uint16_t vid = 0, pid = 0;
   tuh_vid_pid_get(daddr, &vid, &pid);
   LOGF("[host] HID mounted: addr %u idx %u, %04X:%04X, %u-byte descriptor\r\n",
@@ -1316,35 +1691,63 @@ void tuh_hid_mount_cb(uint8_t daddr, uint8_t idx, uint8_t const *desc_report,
   dump_descriptor(desc_report, desc_len);
 #endif
 
-  int8_t const itf = match_interface(desc_report, desc_len);
-  if (itf < 0) {
-#if !PROXY_DIAG
-    dump_descriptor(desc_report, desc_len);
-#endif
-    LOGF("[map] no match -- this interface will not be proxied\r\n");
+  if (desc_len > PROXY_MAX_DESC_LEN) {
+    LOGF("[host] descriptor %u bytes exceeds %u -- cannot clone\r\n", desc_len,
+         (unsigned)PROXY_MAX_DESC_LEN);
+    return;
+  }
+
+  // Slots are filled in mount order, not by interface identity: an unknown
+  // device (the bootloader) has to be proxied just as readily as a known one.
+  int8_t slot = -1;
+  for (uint8_t i = 0; i < PROXY_MAX_HID; i++) {
+    if (!g_link[i].mounted) {
+      slot = (int8_t)i;
+      break;
+    }
+  }
+  if (slot < 0) {
+    LOGF("[host] no free slot for addr %u idx %u -- raise PROXY_MAX_HID\r\n",
+         daddr, idx);
     return;
   }
 
   tuh_itf_info_t info;
   bool const has_out_ep =
       tuh_hid_itf_get_info(daddr, idx, &info) && info.desc.bNumEndpoints >= 2;
+  int8_t const known = match_interface(desc_report, desc_len);
 
-  g_link[itf].daddr = daddr;
-  g_link[itf].idx = idx;
-  g_link[itf].has_out_ep = has_out_ep;
-  __dmb();
-  g_link[itf].mounted = true;
+  host_link_t *link = &g_link[slot];
+  link->daddr = daddr;
+  link->idx = idx;
+  link->has_out_ep = has_out_ep;
+  link->known = known;
+  link->desc_len = desc_len;
+  memcpy(link->desc, desc_report, desc_len);
+  link->mounted_at = millis();
+  link->armed = false;
+  link->in_count = 0;
+  link->rearms = 0; // arm_service() polls it once it has had time to settle
+  __dmb();             // descriptor must be visible on core 0 before it goes live
+  link->mounted = true;
+
+  g_dev_vid = vid;
+  g_dev_pid = pid;
   g_link_settle_at = millis() + PROXY_SETTLE_MS;
 
-  LOGF("[host] itf %u -> %s (OUT endpoint: %s)\r\n", itf, k_itf[itf].name,
+  LOGF("[host] slot %u <- %s, %u-byte descriptor, OUT endpoint: %s\r\n", slot,
+       known >= 0 ? k_itf[known].name : "UNKNOWN (cloning verbatim)", desc_len,
        has_out_ep ? "yes" : "control only");
-
-  if (!tuh_hid_receive_report(daddr, idx)) {
-    LOGF("[host] %s: cannot arm IN endpoint\r\n", k_itf[itf].name);
+  if (known < 0) {
+    LOGF("[map] unrecognised, cloned verbatim (%u bytes):\r\n", desc_len);
+    dump_descriptor(desc_report, desc_len);
   }
+
+  // Deliberately not armed here -- see PROXY_ARM_DELAY_MS.
 }
 
 void tuh_hid_umount_cb(uint8_t daddr, uint8_t idx) {
+  g_core1_phase = C1_UMOUNT_CB;
   for (uint8_t i = 0; i < PROXY_MAX_HID; i++) {
     if (g_link[i].mounted && g_link[i].daddr == daddr && g_link[i].idx == idx) {
       g_link[i].mounted = false;
@@ -1356,8 +1759,10 @@ void tuh_hid_umount_cb(uint8_t daddr, uint8_t idx) {
 
 void tuh_hid_report_received_cb(uint8_t daddr, uint8_t idx,
                                 uint8_t const *report, uint16_t len) {
+  g_core1_phase = C1_REPORT_CB;
   for (uint8_t i = 0; i < PROXY_MAX_HID; i++) {
     if (g_link[i].mounted && g_link[i].daddr == daddr && g_link[i].idx == idx) {
+      g_link[i].in_count++;
       in_report_t *slot = g_inq[i].reserve();
       if (!slot) {
         g_in_dropped++;
