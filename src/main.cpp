@@ -134,7 +134,7 @@
 
 // Ring depth per interface. IN is device->PC (bursty: CTAPHID sends 64-byte
 // continuation frames back to back), OUT is PC->device.
-#define PROXY_IN_QUEUE_LEN 16
+#define PROXY_IN_QUEUE_LEN 32
 // Each slot is PROXY_MAX_OUT_REPORT bytes to accommodate firmware blocks, so
 // depth costs real RAM -- but too shallow silently corrupts a firmware write.
 #define PROXY_OUT_QUEUE_LEN 8
@@ -1266,32 +1266,36 @@ static void usb_build_config(bool with_hid) {
   TinyUSBDevice.setProductDescriptor(PROXY_PRODUCT);
   TinyUSBDevice.setSerialDescriptor(PROXY_SERIAL);
 
+  // HID goes FIRST and the console last, so the cloned interfaces land on the
+  // same interface numbers as the real device (rawhid at MI_02 on an OnlyKey).
+  // Host software routinely locates a raw-HID endpoint by interface number, and
+  // with the console at MI_00/01 everything shifted up by two -- an app looking
+  // for MI_02 found the keyboard instead and silently talked to nothing.
+  // Windows binds the CDC by class and IAD, so its position does not matter.
+  if (with_hid) {
+    // Mirror exactly the interfaces that are live, using the descriptors
+    // captured from the device.
+    for (uint8_t i = 0; i < PROXY_MAX_HID; i++) {
+      host_link_t const *link = &g_link[i];
+      if (!link->mounted || !link->desc_len) {
+        continue;
+      }
+      g_hid[i].setReportDescriptor(link->desc, link->desc_len);
+      g_hid[i].setBootProtocol(link->known >= 0
+                                   ? k_itf[link->known].boot_protocol
+                                   : (uint8_t)HID_ITF_PROTOCOL_NONE);
+      g_hid[i].setPollInterval(1);
+      // Mirror the device: only offer an interrupt OUT endpoint if it has one.
+      g_hid[i].enableOutEndpoint(link->has_out_ep);
+      if (!TinyUSBDevice.addInterface(g_hid[i])) {
+        LOGF("[dev] FAILED to add HID interface %u\r\n", i);
+      }
+      }
+  }
+
 #if PROXY_ENABLE_CDC
-  TinyUSBDevice.addInterface(Serial); // console first, so it keeps MI_00/01
+  TinyUSBDevice.addInterface(Serial); // console last -- see the note above
 #endif
-
-  if (!with_hid) {
-    return;
-  }
-
-  // Mirror exactly the interfaces that are live, using the descriptors captured
-  // from the device. Slots are contiguous from 0, so stop at the first gap.
-  for (uint8_t i = 0; i < PROXY_MAX_HID; i++) {
-    host_link_t const *link = &g_link[i];
-    if (!link->mounted || !link->desc_len) {
-      continue;
-    }
-    g_hid[i].setReportDescriptor(link->desc, link->desc_len);
-    g_hid[i].setBootProtocol(link->known >= 0
-                                 ? k_itf[link->known].boot_protocol
-                                 : (uint8_t)HID_ITF_PROTOCOL_NONE);
-    g_hid[i].setPollInterval(1);
-    // Mirror the device: only offer an interrupt OUT endpoint if it has one.
-    g_hid[i].enableOutEndpoint(link->has_out_ep);
-    if (!TinyUSBDevice.addInterface(g_hid[i])) {
-      LOGF("[dev] FAILED to add HID interface %u\r\n", i);
-    }
-  }
 }
 
 // Tracks what the PC is currently being shown, as opposed to what core 1 wants.
@@ -1423,6 +1427,19 @@ static void arm_service(void) {
     // reports. receive_ready() is false while a request is already pending, so
     // this only re-issues when the chain has actually been broken.
     if (!tuh_hid_receive_ready(link->daddr, link->idx)) {
+      continue;
+    }
+
+    // Never request data we have nowhere to put. Once a report has been
+    // received there is no way to refuse it -- dropping it is silent loss, the
+    // same failure that corrupted firmware writes on the OUT path. Simply not
+    // asking leaves the report in the device, which holds it until we are
+    // ready: real USB flow control instead of a lossy queue.
+    //
+    // reserve() has no side effects, so this is a pure "is there room" probe.
+    // Only one request is outstanding per interface, so one free slot is
+    // exactly enough.
+    if (!g_inq[i].reserve()) {
       continue;
     }
     if (tuh_hid_receive_report(link->daddr, link->idx)) {
