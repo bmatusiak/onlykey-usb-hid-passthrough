@@ -30,6 +30,7 @@
 
 #include <hardware/clocks.h>
 #include <hardware/gpio.h>
+#include <hardware/pio.h>
 #include <hardware/sync.h>
 
 // pio_usb.h must come first: its presence is what puts tusb_config into
@@ -37,6 +38,8 @@
 #include "pio_usb.h"
 
 #include "Adafruit_TinyUSB.h"
+
+#include "log_ring.h"
 
 // --------------------------------------------------------------------------
 // Configuration
@@ -50,11 +53,23 @@
 #define PROXY_DIAG 0
 #endif
 
-#if PROXY_DIAG
+// PROXY_ENABLE_CDC keeps the USB CDC interface alongside the four HID
+// interfaces, giving a COM port on the PC for the command console. The cost is
+// that the device is no longer a byte-for-byte OnlyKey clone: it gains a serial
+// function, and the HID interfaces shift from MI_00..03 to MI_02..05. Nothing
+// binds by interface number -- Windows matches FIDO2 by usage page and the
+// OnlyKey app by VID/PID -- so in practice this is invisible.
+//
+// Set to 0 for a pure HID clone; the console then lives on the UART.
+#ifndef PROXY_ENABLE_CDC
+#define PROXY_ENABLE_CDC 1
+#endif
+
+#if PROXY_DIAG || PROXY_ENABLE_CDC
 #define PROXY_LOG Serial // USB CDC
 #else
-// The native USB port carries no CDC interface in the real proxy build, so the
-// log lives on the hardware UART: TX=GPIO0, RX=GPIO1, 115200 8N1.
+// Without a CDC interface the log lives on the hardware UART:
+// TX=GPIO0, RX=GPIO1, 115200 8N1.
 #define PROXY_LOG Serial1
 #endif
 
@@ -70,6 +85,10 @@
 // How long VBUS stays off during a power cycle. The PC sees this as an unplug,
 // so it wants to be long enough to be unambiguous.
 #define PROXY_POWER_OFF_MS 750
+
+// Ceiling on an explicit "VBUS off" when the console rides on USB. See the
+// PWR_CMD_OFF case for why leaving it off indefinitely would be a trap.
+#define PROXY_POWER_OFF_MAX_MS 30000
 
 // Diagnostic mode re-runs status + a power cycle on this period, so a monitor
 // attached at any time sees a complete enumeration attempt without interaction.
@@ -89,40 +108,41 @@
 static_assert(PROXY_MAX_HID <= CFG_TUD_HID,
               "raise -DCFG_TUD_HID in platformio.ini");
 
-#define LOGF(...)                                                              \
-  do {                                                                         \
-    PROXY_LOG.printf(__VA_ARGS__);                                             \
-  } while (0)
+// Logging never touches the port directly: core 1 and the USB IRQ both log, and
+// neither may block or race core 0's tud_task(). Everything goes into the ring
+// and core 0 drains it in loop(). See include/log_ring.h.
+LogRing g_log_ring;
 
-// TinyUSB's own trace (TU_LOG, enabled by -DCFG_TUSB_DEBUG) is emitted by the
-// library's log_printf(), which writes to SERIAL_TUSB_DEBUG. In the diag build
-// that macro points at this ring buffer rather than a Serial object: log_printf
-// runs in USB IRQ context, and writing straight to the CDC there deadlocks the
-// device stack as soon as the host stops draining. drain_tusb_log() moves it to
-// the real port from loop(), bounded by what the port can accept right now.
-#if defined(CFG_TUSB_DEBUG) && CFG_TUSB_DEBUG
-TusbLogSink g_tusb_log;
+static void log_emit(char const *fmt, ...) {
+  char buf[192];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  buf[sizeof(buf) - 1] = '\0';
+  g_log_ring.write(buf);
+}
 
-static void drain_tusb_log(void) {
+#define LOGF(...) log_emit(__VA_ARGS__)
+
+// Core 0 only: move buffered log text to the real port, bounded by what the
+// port will accept right now so a busy log can never stall loop().
+static void drain_log(void) {
   int room = PROXY_LOG.availableForWrite();
   if (room <= 0) {
     return;
   }
-  // Cap per pass so a busy trace cannot starve the rest of loop().
   if (room > 128) {
     room = 128;
   }
   while (room-- > 0) {
-    int const c = g_tusb_log.read();
+    int const c = g_log_ring.read();
     if (c < 0) {
       break;
     }
     PROXY_LOG.write((uint8_t)c);
   }
 }
-#else
-static void drain_tusb_log(void) {}
-#endif
 
 // --------------------------------------------------------------------------
 // The OnlyKey's report descriptors, as dumped with `usbhid-dump -m 16c0`
@@ -346,9 +366,19 @@ static void power_service(void) {
       g_power_off_until = millis() + PROXY_POWER_OFF_MS;
       break;
     case PWR_CMD_OFF:
-      LOGF("[pwr] VBUS off\r\n");
       power_apply(false);
+#if PROXY_ENABLE_CDC
+      // Detaching to mirror the key also takes the CDC console with it -- a USB
+      // device cannot drop only some of its interfaces. Without a deadline an
+      // explicit "off" would remove the only way to send "on", so it expires.
+      // The BOOT button still works throughout.
+      g_power_off_until = millis() + PROXY_POWER_OFF_MAX_MS;
+      LOGF("[pwr] VBUS off (auto-restore in %u ms; console returns with it)\r\n",
+           (unsigned)PROXY_POWER_OFF_MAX_MS);
+#else
       g_power_off_until = 0;
+      LOGF("[pwr] VBUS off\r\n");
+#endif
       break;
     case PWR_CMD_ON:
       LOGF("[pwr] VBUS on\r\n");
@@ -547,15 +577,156 @@ static void button_service(void) {
   }
 }
 
-// LED blink codes, so the board can be diagnosed with no UART adapter attached.
-enum led_code_t : uint8_t {
-  LED_DARK = 0,    // VBUS off
-  LED_WAIT = 1,    // 1 blink : host stack running, no key found
-  LED_LINKED = 2,  // 2 blinks: key linked, PC has not mounted us
-  LED_PARTIAL = 3, // 3 blinks: some interfaces matched, not all four
-  LED_SOLID = 254, // steady   : proxying
-  LED_STALL = 255, // fast     : core 1 wedged or host stack failed to start
+// --------------------------------------------------------------------------
+// NeoPixel activity indicator
+// --------------------------------------------------------------------------
+//
+// Colour identifies which interface last moved a report, so traffic can be told
+// apart at a glance: keyboard white, FIDO2 yellow, raw HID green, seremu red.
+// Dark when idle -- this is an activity light only. The onboard LED on GPIO 13
+// is the fault light; the two never mean the same thing.
+//
+// Driven from PIO1. Pico-PIO-USB owns PIO0 state machines 0-2, so pinning the
+// pixel to PIO1 keeps it from ever competing with the USB host for a state
+// machine or for instruction memory. If PIO1 is somehow unavailable the
+// indicator silently disables itself rather than disturbing anything.
+
+#define PROXY_PIXEL_BRIGHTNESS 40 // ceiling, 0-255: these are painfully bright
+#define PROXY_PIXEL_PULSE_MS 160  // activity flash decay
+
+static PIO const kPixelPio = pio1;
+static uint kPixelSm = 0;
+static bool g_pixel_ready = false;
+
+// Stock WS2812 program from pico-examples: 10 state-machine cycles per bit.
+static uint16_t const kWs2812Insns[] = {
+    0x6221, // out x, 1   side 0 [2]
+    0x1123, // jmp !x, 3  side 1 [1]
+    0x1400, // jmp 0      side 1 [4]
+    0xa442, // nop        side 0 [4]
 };
+static pio_program_t const kWs2812Program = {
+    .instructions = kWs2812Insns,
+    .length = 4,
+    .origin = -1,
+};
+
+// Set by whichever core forwarded a report. These are plain variable stores --
+// core 1 never touches the PIO, the pixel, or any timing-sensitive code; it only
+// records what just happened and core 0 renders it. A torn read between cores
+// would at worst show the wrong colour for one 20 ms frame, so no locking is
+// warranted.
+static volatile int8_t g_pixel_itf = -1;
+static volatile uint32_t g_pixel_at = 0;
+
+static uint8_t const kItfColour[PROXY_MAX_HID][3] = {
+    {255, 255, 255}, // keyboard: white
+    {255, 200, 0},   // fido2:    yellow
+    {0, 255, 0},     // rawhid:   green
+    {255, 0, 0},     // seremu:   red
+};
+
+// seremu is the Teensy debug channel and chatters continuously (~27 reports/sec
+// measured), so with plain last-writer-wins its red would overwrite every other
+// colour within ~37 ms and nothing else would ever be visible. Ranking it below
+// the rest means it still flashes red when the link is otherwise idle, but a
+// keystroke, FIDO2 exchange or app message always shows through.
+static uint8_t const kItfRank[PROXY_MAX_HID] = {
+    2, // keyboard
+    2, // fido2
+    2, // rawhid
+    1, // seremu
+};
+
+static inline void pixel_note_activity(uint8_t itf) {
+  if (itf >= PROXY_MAX_HID) {
+    return;
+  }
+  uint32_t const now = millis();
+  int8_t const cur = g_pixel_itf;
+  if (cur >= 0 && cur < (int8_t)PROXY_MAX_HID &&
+      (now - g_pixel_at) < PROXY_PIXEL_PULSE_MS &&
+      kItfRank[itf] < kItfRank[cur]) {
+    return; // don't let debug chatter paint over something more interesting
+  }
+  g_pixel_itf = (int8_t)itf;
+  g_pixel_at = now;
+}
+
+static void pixel_begin(void) {
+#ifdef NEOPIXEL_POWER
+  pinMode(NEOPIXEL_POWER, OUTPUT);
+  digitalWrite(NEOPIXEL_POWER, HIGH);
+#endif
+
+  // Ask before loading: depending on SDK version pio_add_program can panic
+  // rather than return an error, and a hung board is a far worse outcome than
+  // no status light.
+  if (!pio_can_add_program(kPixelPio, &kWs2812Program)) {
+    return;
+  }
+  int const offset = pio_add_program(kPixelPio, &kWs2812Program);
+  if (offset < 0) {
+    return;
+  }
+  int const sm = pio_claim_unused_sm(kPixelPio, false);
+  if (sm < 0) {
+    return;
+  }
+  kPixelSm = (uint)sm;
+
+  pio_gpio_init(kPixelPio, PIN_NEOPIXEL);
+  pio_sm_set_consecutive_pindirs(kPixelPio, kPixelSm, PIN_NEOPIXEL, 1, true);
+
+  pio_sm_config c = pio_get_default_sm_config();
+  sm_config_set_wrap(&c, (uint)offset, (uint)offset + 3);
+  sm_config_set_sideset(&c, 1, false, false);
+  sm_config_set_sideset_pins(&c, PIN_NEOPIXEL);
+  sm_config_set_out_shift(&c, false, true, 24); // MSB first, autopull at 24
+  sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+  sm_config_set_clkdiv(&c, (float)clock_get_hz(clk_sys) / (800000.0f * 10.0f));
+  pio_sm_init(kPixelPio, kPixelSm, (uint)offset, &c);
+  pio_sm_set_enabled(kPixelPio, kPixelSm, true);
+
+  g_pixel_ready = true;
+}
+
+static void pixel_put(uint8_t r, uint8_t g, uint8_t b) {
+  if (!g_pixel_ready) {
+    return;
+  }
+  // WS2812 wants GRB, MSB first, left-aligned for a 24-bit autopull.
+  uint32_t const grb = ((uint32_t)g << 16) | ((uint32_t)r << 8) | (uint32_t)b;
+  pio_sm_put_blocking(kPixelPio, kPixelSm, grb << 8u);
+}
+
+static void pixel_service(void) {
+  static uint32_t next = 0;
+  if (!g_pixel_ready || (int32_t)(millis() - next) < 0) {
+    return;
+  }
+  next = millis() + 20; // 50 Hz is plenty and keeps the FIFO idle
+
+  // Dark at rest: this pixel reports traffic only. Anything wrong (partial
+  // match, PC not mounted, core 1 wedged) lights the onboard LED instead, so the
+  // two indicators never compete for the same meaning.
+  uint8_t r = 0, g = 0, b = 0;
+
+  // Activity: fade from the interface colour back to dark.
+  int8_t const itf = g_pixel_itf;
+  uint32_t const since = millis() - g_pixel_at;
+  if (itf >= 0 && itf < (int8_t)PROXY_MAX_HID && since < PROXY_PIXEL_PULSE_MS) {
+    uint32_t const fade = 255 - (since * 255 / PROXY_PIXEL_PULSE_MS);
+    uint8_t const *c = kItfColour[itf];
+    r = (uint8_t)((c[0] * fade + r * (255 - fade)) / 255);
+    g = (uint8_t)((c[1] * fade + g * (255 - fade)) / 255);
+    b = (uint8_t)((c[2] * fade + b * (255 - fade)) / 255);
+  }
+
+  pixel_put((uint8_t)(r * PROXY_PIXEL_BRIGHTNESS / 255),
+            (uint8_t)(g * PROXY_PIXEL_BRIGHTNESS / 255),
+            (uint8_t)(b * PROXY_PIXEL_BRIGHTNESS / 255));
+}
 
 // Core 0: has core 1 advanced since the last check?
 static bool core1_alive(void) {
@@ -571,12 +742,20 @@ static bool core1_alive(void) {
   return alive;
 }
 
-static uint8_t led_code(void) {
+// The onboard LED on GPIO 13 is a fault light, nothing else: dark when idle or
+// working normally, lit when something needs attention. An empty host port is
+// not a fault, so no key attached means dark.
+//
+// Faults are:
+//   - core 1 wedged, or the host stack never started
+//   - a key is attached but not all four interfaces matched
+//   - all four matched but the PC has not mounted the proxy
+static bool led_fault(void) {
   if (g_core1_fatal || !core1_alive()) {
-    return LED_STALL;
+    return true;
   }
   if (!g_power_is_on) {
-    return LED_DARK;
+    return false; // VBUS deliberately cut; nothing is expected to be up
   }
 
   uint8_t linked = 0;
@@ -586,64 +765,39 @@ static uint8_t led_code(void) {
     }
   }
   if (linked == 0) {
-    return LED_WAIT;
+    return false; // empty port is a normal resting state, not a problem
+  }
+  if (linked < PROXY_MAX_HID) {
+    return true; // key present but an interface failed to match
   }
 #if PROXY_DIAG
-  // Nothing is presented to the PC in diagnostic mode, so report the host-side
-  // result: all four matched, or only some.
-  return (linked == PROXY_MAX_HID) ? LED_SOLID : LED_PARTIAL;
+  // Diagnostic builds never present anything to the PC, so stop here.
+  return false;
 #else
-  if (g_pc_attached && TinyUSBDevice.mounted()) {
-    return LED_SOLID;
-  }
-  return (linked == PROXY_MAX_HID) ? LED_LINKED : LED_PARTIAL;
+  return !(g_pc_attached && TinyUSBDevice.mounted());
 #endif
 }
 
+// A fault has to persist before it lights the LED: enumeration, the settle
+// window and the deliberate power cycles all pass briefly through states that
+// look faulty, and flickering on those would train you to ignore the light.
+#define PROXY_LED_FAULT_MS 2000
+
 static void led_service(void) {
-  static uint32_t next = 0;
-  static uint8_t code = LED_DARK;
-  static uint8_t step = 0;
+  static uint32_t changed_at = 0;
+  static bool last_fault = false;
   static bool on = false;
 
-  uint8_t const want = led_code();
-  if (want != code) {
-    code = want;
-    step = 0;
-    next = millis();
+  bool const fault = led_fault();
+  if (fault != last_fault) {
+    last_fault = fault;
+    changed_at = millis();
   }
 
-  if (code == LED_DARK || code == LED_SOLID) {
-    bool const level = (code == LED_SOLID);
-    if (on != level) {
-      on = level;
-      digitalWrite(PIN_LED, level);
-    }
-    return;
-  }
-
-  if ((int32_t)(millis() - next) < 0) {
-    return;
-  }
-
-  if (code == LED_STALL) {
-    on = !on;
+  bool const want = fault && (millis() - changed_at) >= PROXY_LED_FAULT_MS;
+  if (want != on) {
+    on = want;
     digitalWrite(PIN_LED, on);
-    next = millis() + 100;
-    return;
-  }
-
-  // Otherwise `code` is a blink count: N short pulses, then a long gap.
-  if (step < (uint8_t)(code * 2)) {
-    on = ((step % 2) == 0);
-    digitalWrite(PIN_LED, on);
-    next = millis() + 150;
-    step++;
-  } else {
-    on = false;
-    digitalWrite(PIN_LED, LOW);
-    next = millis() + 1000;
-    step = 0;
   }
 }
 
@@ -651,6 +805,7 @@ void setup() {
   PROXY_LOG.begin(115200);
   pinMode(PIN_LED, OUTPUT);
   pinMode(PIN_BUTTON, INPUT_PULLUP);
+  pixel_begin(); // core 0 only -- see the note above pixel_service()
 
   // Deliberately no wait for the port to be opened, and no keypress gate. Both
   // depended on tud_cdc_connected(), i.e. on the host asserting DTR, which made
@@ -665,12 +820,20 @@ void setup() {
 #if PROXY_DIAG
   LOGF("[dev] DIAGNOSTIC MODE: USB config left alone, nothing is proxied\r\n");
 #else
-  // Replace the core's default CDC-only configuration with the four HID
-  // interfaces. arduino-pico has already brought the device stack up, so detach
-  // before rebuilding the descriptors.
+  // arduino-pico has already brought the device stack up with a CDC-only
+  // configuration, so detach before touching the descriptors.
   TinyUSBDevice.detach();
   delay(10);
+#if !PROXY_ENABLE_CDC
+  // Pure HID clone: throw the CDC configuration away and build our own.
   TinyUSBDevice.clearConfiguration();
+#else
+  // Keep the core's configuration and append to it. This is deliberate: the
+  // CDC needs an Interface Association Descriptor for Windows to bind it in a
+  // composite device, and the device-level class/subclass/protocol that go with
+  // an IAD are set inside TinyUSBDevice.begin() with no public setter to
+  // restore them. Building on the existing configuration inherits them.
+#endif
   TinyUSBDevice.setID(PROXY_VID, PROXY_PID);
   TinyUSBDevice.setManufacturerDescriptor(PROXY_MANUFACTURER);
   TinyUSBDevice.setProductDescriptor(PROXY_PRODUCT);
@@ -734,6 +897,7 @@ static void forward_in(void) {
       }
       g_inq[i].pop();
       g_in_sent++;
+      pixel_note_activity(i);
     }
   }
 }
@@ -763,10 +927,11 @@ void loop() {
   forward_in();
 #endif
 
-  drain_tusb_log();
+  drain_log();
   console_service();
   button_service();
   led_service();
+  pixel_service(); // core 0 only: the sole place the pixel PIO is touched
 }
 
 // --------------------------------------------------------------------------
@@ -828,6 +993,7 @@ static void forward_out(void) {
       }
       g_outq[i].pop();
       g_out_sent++;
+      pixel_note_activity(i); // variable store only; core 0 does the rendering
     }
   }
 }
