@@ -144,8 +144,8 @@ Open the COM port at 115200 (`pio device monitor`). Single keypresses, no Enter:
 |---|---|
 | `p` | power-cycle the host port (off 750 ms, on) |
 | `0` / `1` | host port off (stays off) / on |
-| `R` | **reboot the RP2040 — this is what puts the KEY into its bootloader** |
-| `b` | pulse the bootloader contact; only wakes a key that is not enumerating |
+| `b` | **pulse the bootloader contact — reboots a running key into HalfKay** |
+| `R` | reboot the RP2040; fallback bootloader entry for an unresponsive key |
 | `i` | status: core health, link state, per-slot counters, button, pins |
 | `h` | raw D+/D− pad levels and the pre-init probe result |
 | `x` | re-print the report descriptors captured from the attached device |
@@ -428,45 +428,60 @@ which stalled forwarding after a few hundred reports. `tuh_hid_receive_ready()`
 is false while a request is pending, so this only re-issues when the chain has
 genuinely broken. The `rearm` counter in `i` shows when that happens.
 
-### Entering the key's bootloader — the exact procedure
+### Entering the key's bootloader
 
-The key samples its bootloader contact **only at power-up**. Grounding it while
-the key is running does nothing; this was measured, including a 3-second hold.
-Two consequences follow, and both are counter-intuitive:
+Pulling the bootloader contact to ground for ~300 ms reboots a **running** key
+straight into HalfKay. That is what `b` does, and it is the normal route:
 
-- **`b` will not put a running key into the bootloader.** It is only useful for
-  a key that is not enumerating at all.
-- **The `p` / `0` / `1` VBUS commands cannot help either.** Phantom power through
-  D+/D− means cutting VBUS does not actually de-power the key, so it never gets
-  the fresh startup at which the contact is read.
+```
+[bsel] contact held low for 300 ms
+[host] device detached: addr 1
+[host] itf 0 (keyboard) unmounted        ... and the rest
+```
 
-What works is **`R`** — reboot the RP2040 — because an RP2040 reset happens to do
-both required things at once:
+The proxy then follows the key automatically. Observed from the PC side, the
+whole swap takes about a second:
 
-1. GPIO 18 goes undriven, so the load switch genuinely opens and the key really
-   loses power (unlike the VBUS commands).
-2. GPIO 6 reverts to input-with-pull-down, holding the contact grounded across
-   the key's power-up.
+```
+15:39:02  VID_1D50&PID_60FC   app mode, 4 HID interfaces + console
+15:39:58  (nothing)           key entered bootloader, proxy detached
+15:39:59  VID_16C0&PID_0478   HalfKay: MI_00 = HID, MI_01 = console
+```
 
-So the exact sequence is:
+No reset, no power cycle, no intervention: the key swaps its descriptors, core 1
+sees the unmounts, the new descriptor is cloned, the configuration is rebuilt
+around it and the VID/PID is adopted. Interface numbering adapts too — HalfKay's
+single HID lands at MI_00, so a flashing tool sees the same layout as a
+directly-attached key.
+
+`R` (reboot the RP2040) is a **fallback** for when the key is not responding at
+all. During an RP2040 reset GPIO 18 goes undriven and GPIO 6 reverts to
+input-with-pull-down, so the contact is held grounded across the key restarting.
+Direct-wire only: with a transistor that pull-down holds the gate *off*, so the
+contact is released and the key boots normally.
+
+Observed, without a confirmed mechanism: the `p` / `0` / `1` VBUS commands do
+**not** make the key re-run its startup. Bootloader entry by "hold the contact
+across a VBUS cycle" never worked, and a soft reboot out of HalfKay does not
+reproduce a cold boot either. A physical unplug/replug does. Treat the VBUS
+commands as "drop the device off the bus", not "power it down".
+
+### The exact flashing procedure
 
 ```bash
 # 1. put the key into its bootloader
-#    press R in the console, or simply reflash the Feather -- same mechanism
-#    verify: the port reappears as 16C0:0478
+#    press 'b' in the console; verify the port reappears as 16C0:0478
 
 # 2. flash
 python tools/halfkay_flash.py firmware.hex
 
 # 3. verify
-#    the port returns as 1D50:60FC with all interfaces cloned, and
-#    PC->dev in the `i` output must read "N sent, 0 dropped"
+#    the port returns as 1D50:60FC with every interface cloned, and
+#    `i` must show BOTH counters reading "N sent, 0 dropped"
 ```
 
-**`R` is direct-wire only.** With a transistor the same reset-time pull-down
-holds the gate *off*, releasing the contact, so the key boots normally instead —
-which is the safer behaviour for everyday use but means bootloader entry then
-needs the key's own button.
+Step 3's zero-drop check is not optional — see *back-pressure* below. A drop on
+`PC->dev` during a flash means a corrupted image that will not boot.
 
 ### Recovering a key that is not enumerating
 
@@ -537,42 +552,35 @@ Top of `src/main.cpp`.
 | `PROXY_MAX_HID` | `4` | Must be ≤ `CFG_TUD_HID` in `platformio.ini` |
 | `PROXY_PIXEL_BRIGHTNESS` | `40` | NeoPixel ceiling, 0–255 |
 | `PROXY_LED_FAULT_MS` | `2000` | How long a fault must persist before GPIO 13 lights |
-| `PROXY_CUT_DATA_LINES` | `0` | See *phantom power* below — **known to wedge the host stack** |
+| `PROXY_CUT_DATA_LINES` | `0` | Unproven experiment — **known to wedge the host stack** |
 
 ---
 
 ## Known issues
 
-**Phantom power.** Cutting VBUS does *not* de-power the attached key. PIO keeps
-driving D+/D−, and current flows through the device's ESD clamp diodes into its
-supply rail, so the key stays lit and never truly resets. Symptoms that look
-like a power cycle (host stack reporting `0 HID itf bound`, `GPIO18 reads 0`)
-only mean the device left the *bus* — not that it lost power.
+**VBUS commands are not a true power cycle.** Cutting VBUS drops the key off
+the bus, but it does not make the key re-run its startup — bootloader entry by
+holding the contact across a VBUS cycle never worked, and neither does a soft
+reboot out of HalfKay reproduce a cold boot. The mechanism is not established;
+this is an observation. Only a physical unplug/replug is known to give a genuine
+cold start.
 
-`PROXY_CUT_DATA_LINES=1` releases the pads to remove that path, but it **wedges
-Pico-PIO-USB**: the host stack stops servicing and the command that would
-restore power never runs, so the board needs a manual reset. Doing it safely
-needs the PIO state machines stopped first. Off by default.
+`PROXY_CUT_DATA_LINES=1` releases the data pads during power-off on the theory
+that leakage through them keeps the device alive. It is **off by default and
+unproven** — it also wedges Pico-PIO-USB, because releasing the pads mid-flight
+stops the host stack servicing and the command that would restore power never
+runs. Doing it safely would need the PIO state machines stopped first.
 
-Consequence: a true power-cycle of the key requires physically unplugging it.
-The `p` / `0` / `1` commands drop it off the bus, which is enough to re-enumerate
-it, but not enough to make it re-run its startup — so they cannot be used to
-enter the bootloader by "power up with the button held". Use the `b` command,
-which reboots a running key into the bootloader directly.
+**Core 1 stalls — believed fixed.** Core 1 used to wedge whenever the key
+switched between application and bootloader mode. The phase instrumentation
+localised it to a call to `tuh_hid_itf_get_total_count()`, which walks the HID
+host driver's interface table from outside the normal task flow — while the
+driver was tearing those very entries down. It was only feeding a cosmetic
+counter, so the count is now derived from our own `g_link[]` and the driver's
+internals are left alone. A live application -> bootloader swap has since
+completed cleanly with core 1 still running.
 
-**A key that lost power while in its bootloader comes back with no USB
-descriptors at all** — silent on the bus, indistinguishable from an empty port.
-It is not broken; it needs the bootloader contact poked, which is what the
-auto-recovery above does. Without the GPIO 6 wiring, unplug it and re-insert it
-while holding its bootloader button.
-
-**The bootloader contact is sampled only at power-up.** Grounding it on a
-running key does nothing, so `b` cannot trigger bootloader entry and neither can
-the VBUS commands. Use `R`. See *Entering the key's bootloader* above.
-
-**Core 1 stalls.** Core 1 has wedged during device mode transitions, in both the
-proxy and `diag` builds. Recovery requires a reset — which power-cycles the key.
-The `last phase:` field in `i` reports where it stopped; not yet root-caused.
+If it ever recurs, `last phase:` in `i` names the step it died in.
 
 **GET_REPORT stalls.** The host-side get is asynchronous and the device-side
 callback must answer synchronously, so control-pipe `GET_REPORT` returns a
@@ -607,6 +615,8 @@ interface cannot be cloned.
 - Automatic recovery of a descriptor-less key via the bootloader contact
 - **The full cycle exercised end to end**: bootloader entry, flash, reboot,
   return to application mode, raw-HID response — repeatedly, zero drops
+- **Live descriptor swap**: `b` reboots a running key into HalfKay and the proxy
+  follows it in ~1 s with no reset, verified from the Windows device list
 - Power control by console and BOOT button; console-only re-enumeration
 - Clean build under `-Wall -Wextra` across all three environments
 

@@ -449,13 +449,14 @@ static void pc_present_set(bool present) {
   g_pc_present_req = present;
 }
 
-// Cutting VBUS alone does not actually de-power the attached device. PIO keeps
-// driving D+/D-, and current flows through the device's ESD clamp diodes into
-// its own supply rail -- "phantom power". The attached key stays lit and never
-// truly resets.
+// UNPROVEN. Observation: cutting VBUS drops the key off the bus but does not
+// make it re-run its startup -- entering the bootloader by holding the contact
+// across a VBUS cycle never worked. One hypothesis was leakage through the data
+// lines keeping the device alive; that was never confirmed and should not be
+// stated as fact.
 //
-// Taking the pads away from PIO and holding them low removes that path, which
-// is also what a genuinely disconnected bus looks like (SE0). It is OFF by
+// This releases the pads during power-off to remove any such path, which is also
+// what a genuinely disconnected bus looks like (SE0). It is OFF by
 // default: releasing the pads mid-flight wedges Pico-PIO-USB, so the host stack
 // stops servicing and the command that would restore power never runs, leaving
 // the board reachable only via a manual reset. Kept rather than deleted because
@@ -500,7 +501,7 @@ static void power_apply(bool on) {
     pc_present_set(false);
     g_seen_device = false; // fresh power-up may legitimately need recovery
 #if PROXY_CUT_DATA_LINES
-    host_pins_release(); // before VBUS drops, so no phantom-power window opens
+    host_pins_release(); // before VBUS drops -- see the note above
 #endif
   }
 
@@ -695,6 +696,10 @@ static void print_status(void) {
 // stays quiet and command output is easy to read.
 static bool g_heartbeat = false;
 
+// Log every host->device report as it is forwarded. Off by default: a firmware
+// flash produces one line per block.
+static volatile bool g_out_verbose = false;
+
 // --------------------------------------------------------------------------
 // OnlyKey bootloader contact (core 0 only)
 // --------------------------------------------------------------------------
@@ -831,6 +836,11 @@ static void console_service(void) {
     case 'H':
       print_host_pins();
       break;
+    case 'v':
+    case 'V':
+      g_out_verbose = !g_out_verbose;
+      LOGF("[out] verbose %s\r\n", g_out_verbose ? "ON" : "off");
+      break;
     case 't':
     case 'T':
       g_heartbeat = !g_heartbeat;
@@ -853,11 +863,11 @@ static void console_service(void) {
     case 'R':
       // Reboot the RP2040 to put the attached key into ITS bootloader.
       //
-      // The key only samples its bootloader contact at power-up, and our VBUS
-      // switch cannot truly de-power it (phantom power through D+/D-). An
-      // RP2040 reset does both at once: GPIO18 goes undriven so the load
-      // switch really opens, and GPIO6 reverts to input-with-pull-down,
-      // holding the contact grounded across the key's power-up.
+      // Fallback for a key that is not responding at all. The VBUS commands do
+      // not make the key re-run its startup (observed; mechanism unconfirmed),
+      // whereas during an RP2040 reset GPIO18 goes undriven and GPIO6 reverts
+      // to input-with-pull-down, holding the contact grounded while the key
+      // restarts.
       //
       // Direct-wire only. With a transistor the same pull-down holds the gate
       // OFF, so the contact is released and the key boots normally.
@@ -1522,6 +1532,19 @@ static void forward_out(void) {
         continue;
       }
 
+      // Log what we are about to forward: length, transport, and the first
+      // bytes -- enough to compare two hosts' packets byte-for-byte. HalfKay's
+      // reboot is 0xFF 0xFF 0xFF followed by zeros, so it is recognisable.
+      if (g_out_verbose) {
+        LOGF("[out] slot %u id=%u type=%u len=%u : %02X %02X %02X %02X "
+             "%02X %02X %02X %02X\r\n",
+             i, rpt->report_id, rpt->report_type, rpt->len,
+             rpt->len > 0 ? rpt->data[0] : 0, rpt->len > 1 ? rpt->data[1] : 0,
+             rpt->len > 2 ? rpt->data[2] : 0, rpt->len > 3 ? rpt->data[3] : 0,
+             rpt->len > 4 ? rpt->data[4] : 0, rpt->len > 5 ? rpt->data[5] : 0,
+             rpt->len > 6 ? rpt->data[6] : 0, rpt->len > 7 ? rpt->data[7] : 0);
+      }
+
       bool ok;
       if (link->has_out_ep && rpt->report_type == HID_REPORT_TYPE_OUTPUT) {
         if (!tuh_hid_send_ready(link->daddr, link->idx)) {
@@ -1721,12 +1744,20 @@ void loop1() {
 
   // Publish what the HID host driver has actually bound, so core 0 can report
   // it without touching tuh_*.
+  // Deliberately NOT calling tuh_hid_itf_get_total_count() here. It reaches
+  // into the HID host driver's interface table from outside the normal task
+  // flow, and core 1 reproducibly wedged inside this exact window while the
+  // driver was tearing those entries down during a device mode switch
+  // (application <-> bootloader). The count is cosmetic, so derive it from
+  // state we own instead of touching the driver's.
   g_core1_phase = C1_POLL;
-  static uint32_t next_poll = 0;
-  if ((int32_t)(millis() - next_poll) >= 0) {
-    next_poll = millis() + 250;
-    g_host_hid_count = tuh_hid_itf_get_total_count();
+  uint8_t bound = 0;
+  for (uint8_t i = 0; i < PROXY_MAX_HID; i++) {
+    if (g_link[i].mounted) {
+      bound++;
+    }
   }
+  g_host_hid_count = bound;
   g_core1_phase = C1_IDLE;
 
 #if !PROXY_DIAG
