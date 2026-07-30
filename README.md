@@ -220,6 +220,40 @@ RP2040 sits in its bootloader. So a key cannot be put into its bootloader
 
 ---
 
+## Flashing the OnlyKey through the proxy
+
+[`tools/halfkay_flash.py`](tools/halfkay_flash.py) drives a Teensy HalfKay
+bootloader on Windows. It is a Python port of the parts of `teensy_loader_cli`
+we need — that project must be compiled and there is no native compiler here,
+and a scriptable flasher makes the proxy testable.
+
+**Standalone**: stock Python plus `hid.dll`, no `teensy_loader_cli` checkout, no
+build step, no third-party packages. Supply your own `.hex` by path.
+
+```bash
+python tools/halfkay_flash.py firmware.hex               # program, then reboot
+python tools/halfkay_flash.py firmware.hex --no-reboot   # leave in bootloader
+python tools/halfkay_flash.py --boot-only                # just reboot the key
+```
+
+It talks to `hid.dll` directly, so writes go out as control-pipe `SET_REPORT`s —
+the same path the proxy forwards. Defaults target the OnlyKey's MK20DX256
+(256 KB, 1024-byte blocks); `--code-size` / `--block-size` cover other parts.
+
+Faithful to `teensy_loader_cli`: 3 address bytes + 61 pad + 1024-byte block,
+always sends block 0 to trigger the chip erase and waits 3 s after it, skips
+blank blocks, and finishes with the `FF FF FF` reboot packet.
+
+**After any flash, check `PC->dev` in the `i` output.** It must read
+`210 sent, 0 dropped` (or whatever the block count is) with **zero drops** — see
+*back-pressure* below for why a drop there means a corrupted image rather than a
+lost keystroke.
+
+The official Teensy Loader GUI works through the proxy too; the CLI tool just
+makes it repeatable.
+
+---
+
 ## ⚠ The 240 MHz requirement
 
 **`board_build.f_cpu = 240000000L` is required, not a preference.**
@@ -326,6 +360,30 @@ Two non-obvious constraints live in that path:
   there is no public setter. Windows still binds `usbser.sys` to a CDC-only
   configuration with `bDeviceClass = 0` — verified empirically, not assumed.
 
+### Back-pressure on host→device reports
+
+**This is the most important detail in the project.** `set_report_thunk()` runs
+on core 0 from the device stack, and by the time it is called the host has
+*already been ACKed*. Returning without queueing therefore tells the host
+"delivered" while discarding the data — silent loss the sender believes
+succeeded.
+
+That is harmless for a keystroke and catastrophic for a firmware block. With an
+earlier 4-slot queue, a firmware flash pushed 210 blocks back-to-back faster
+than core 1 could forward them as control transfers, and **162 of 210 blocks
+were dropped**. Both the official Teensy Loader and the CLI tool reported
+success and wrote a corrupt image; the key then would not boot, which looked for
+hours like a bootloader-entry problem rather than data loss.
+
+So the queue is 8 slots deep and, when full, the callback **blocks** for up to
+`PROXY_OUT_BLOCK_MS` (250 ms) waiting for a slot rather than dropping. Core 1
+drains independently, so spinning cannot deadlock; the bound stops a wedged host
+stack from hanging the device stack forever. A correct flash now reports
+`PC->dev : 210 sent, 0 dropped` and takes ~6.8 s rather than a dishonest 3.8 s.
+
+If you change anything in the OUT path, check that counter after a flash. Drops
+there mean corrupted firmware, not dropped keystrokes.
+
 ### IN endpoint arming
 
 Interfaces are polled only after `PROXY_ARM_DELAY_MS` (500 ms), so a device that
@@ -344,9 +402,23 @@ A key powered down *while in its bootloader* comes back with **no USB
 descriptors at all** — silent on the bus, indistinguishable from an empty port.
 It is not broken; it just needs the bootloader contact poked.
 
-When the port stays silent for `PROXY_BOOTSEL_AUTO_MS` (6 s) with power on, the
-firmware pulses the contact, up to 3 attempts, then stops rather than poking
-forever. This requires the GPIO 6 wiring above; without it, recover by hand.
+When the port stays silent with power on, the firmware pulses the contact, up to
+3 attempts, then stops rather than poking forever. This requires the GPIO 6
+wiring above; without it, recover by hand.
+
+The wait depends on whether anything has been seen since power-up:
+
+- **Nothing ever enumerated** → `PROXY_BOOTSEL_AUTO_MS` (6 s). This is the
+  genuinely stuck case.
+- **A device appeared and went away** → `PROXY_BOOTSEL_REBOOT_GRACE_MS` (30 s).
+  It is probably rebooting into firmware just flashed through us, and reboots
+  can take well over 6 s. Poking then knocks it straight back into the
+  bootloader, which loops forever — an earlier 6 s-for-everything rule did
+  exactly that after every flash.
+
+The distinction is a *longer wait*, not a refusal: an earlier version latched
+"seen a device" and never cleared it on a physical unplug, leaving a genuinely
+stuck key unrecoverable.
 
 ### Logging
 
@@ -387,6 +459,9 @@ Top of `src/main.cpp`.
 | `PROXY_BOOTSEL_ACTIVE_HIGH` | `1` | `1` = via transistor (drive high), `0` = direct open-drain |
 | `PROXY_BOOTSEL_AUTO` | `1` | Auto-pulse the contact when the port stays silent |
 | `PROXY_MAX_OUT_REPORT` | `1152` | Largest host→device report; sized for HalfKay's 1089 bytes |
+| `PROXY_OUT_QUEUE_LEN` | `8` | Host→device queue depth. Too shallow silently corrupts firmware writes |
+| `PROXY_OUT_BLOCK_MS` | `250` | How long to wait for a free slot before giving up (see *back-pressure*) |
+| `PROXY_BOOTSEL_REBOOT_GRACE_MS` | `30000` | Silence tolerated before poking a key that has already enumerated once |
 | `PROXY_ARM_DELAY_MS` | `500` | Settle time before first polling an interface |
 | `PROXY_POWER_OFF_MS` | `750` | Off duration for `p` |
 | `PROXY_MAX_HID` | `4` | Must be ≤ `CFG_TUD_HID` in `platformio.ini` |
@@ -410,6 +485,16 @@ restore power never runs, so the board needs a manual reset. Doing it safely
 needs the PIO state machines stopped first. Off by default.
 
 Consequence: a true power-cycle of the key requires physically unplugging it.
+The `p` / `0` / `1` commands drop it off the bus, which is enough to re-enumerate
+it, but not enough to make it re-run its startup — so they cannot be used to
+enter the bootloader by "power up with the button held". Use the `b` command,
+which reboots a running key into the bootloader directly.
+
+**A key that lost power while in its bootloader comes back with no USB
+descriptors at all** — silent on the bus, indistinguishable from an empty port.
+It is not broken; it needs the bootloader contact poked, which is what the
+auto-recovery above does. Without the GPIO 6 wiring, unplug it and re-insert it
+while holding its bootloader button.
 
 **Core 1 stalls.** Core 1 has wedged during device mode transitions, in both the
 proxy and `diag` builds. Recovery requires a reset — which power-cycles the key.
@@ -435,23 +520,28 @@ interface cannot be cloned.
 
 **Verified working:**
 
-- Application mode: all four interfaces cloned and linked, PC mounts the proxy,
+- Application mode: all interfaces cloned and linked, PC mounts the proxy,
   reports forwarding both directions
 - Bootloader mode: HalfKay cloned and presented as `16C0:0478`, HID capabilities
   byte-identical to a direct connection
+- **A complete, correct firmware flash through the proxy** — 210 blocks,
+  215 KB, `PC->dev : 210 sent, 0 dropped`, after which the key boots the new
+  firmware and returns to application mode on its own
 - Automatic recovery of a descriptor-less key via the bootloader contact
 - Power off/on and power-cycle, by console and by BOOT button
 - Console-only re-enumeration while the host port is off, and recovery from it
+- Clean build under `-Wall -Wextra` across all three environments
 
 **Not verified — needs a human at the keyboard:**
 
 - **Keystrokes from the OnlyKey actually reaching the PC** (expect a white pulse)
 - **A WebAuthn / FIDO2 login through the proxy** (expect yellow)
 - **The OnlyKey desktop app talking to the key** (expect green)
-- **An actual firmware flash through the proxy.** Buffers are sized correctly
-  and enumeration is proven, but a flash is hundreds of sequential 1089-byte
-  transfers through the cross-core queues, each re-issued as a fresh control
-  transfer, and the flashing tool has timeouts. Sustained throughput has not
-  been measured.
-- **Sustained forwarding after the arming fix.** The self-healing re-arm is
-  implemented but was never exercised in application mode.
+
+Report counters prove bytes move; they cannot prove the host *interprets* them.
+
+**Notes on reading the counters:** `dev->PC` sitting still is not necessarily a
+fault — the keyboard, FIDO2 and raw HID interfaces only send on user action, and
+seremu goes quiet once it has flushed its startup output. The `rearm` column is
+the real health signal: non-zero means an IN request chain broke and had to be
+restarted.

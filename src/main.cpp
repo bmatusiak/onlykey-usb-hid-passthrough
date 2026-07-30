@@ -135,10 +135,14 @@
 // Ring depth per interface. IN is device->PC (bursty: CTAPHID sends 64-byte
 // continuation frames back to back), OUT is PC->device.
 #define PROXY_IN_QUEUE_LEN 16
-// Shallower than the IN queue on purpose: each slot is now PROXY_MAX_OUT_REPORT
-// bytes to accommodate firmware blocks, so depth costs real RAM. Host-to-device
-// traffic is request/response and never bursts the way input reports do.
-#define PROXY_OUT_QUEUE_LEN 4
+// Each slot is PROXY_MAX_OUT_REPORT bytes to accommodate firmware blocks, so
+// depth costs real RAM -- but too shallow silently corrupts a firmware write.
+#define PROXY_OUT_QUEUE_LEN 8
+
+// How long set_report_thunk() will wait for a free slot before giving up. The
+// host has already been told the transfer succeeded by the time we could
+// refuse, so waiting is the only way to avoid losing data.
+#define PROXY_OUT_BLOCK_MS 250
 
 #define PROXY_MAX_HID 4
 static_assert(PROXY_MAX_HID <= CFG_TUD_HID,
@@ -359,6 +363,11 @@ enum power_cmd_t : uint8_t {
   PWR_CMD_ON,
 };
 
+// Has any device enumerated since VBUS last came up? Gates auto-recovery: a key
+// that has appeared once is rebooting rather than stuck, and must be left alone.
+// Cleared on every power-off so a fresh power-up can recover again.
+static bool g_seen_device = false;
+
 static volatile uint8_t g_power_cmd; // core 0 writes, core 1 consumes
 static volatile bool g_power_is_on;  // core 1 writes, core 0 reads
 static uint32_t g_power_off_until;   // core 1 only
@@ -480,6 +489,7 @@ static void power_apply(bool on) {
     }
     g_link_settle_at = 0;
     pc_present_set(false);
+    g_seen_device = false; // fresh power-up may legitimately need recovery
 #if PROXY_CUT_DATA_LINES
     host_pins_release(); // before VBUS drops, so no phantom-power window opens
 #endif
@@ -573,7 +583,21 @@ static void set_report_thunk(uint8_t report_id, hid_report_type_t report_type,
   // Interrupt-OUT traffic arrives with report_id == 0 and the raw report in the
   // buffer. None of the OnlyKey's descriptors declare report IDs, so the buffer
   // passes through untouched.
+  // Back-pressure rather than drop. This callback runs on core 0 from the
+  // device stack, and returning without queueing still ACKs the SET_REPORT to
+  // the host -- so a drop is silent data loss the host believes succeeded.
+  // Harmless for a keystroke; catastrophic for a firmware block, which is
+  // exactly how 162 of 210 blocks were lost while the flasher reported success.
+  //
+  // Core 1 drains the queue independently, so spinning here does not deadlock.
+  // Bounded so a wedged host stack cannot hang the device stack forever.
   out_report_t *slot = g_outq[ITF].reserve();
+  if (!slot) {
+    uint32_t const deadline = millis() + PROXY_OUT_BLOCK_MS;
+    while (!slot && (int32_t)(millis() - deadline) < 0) {
+      slot = g_outq[ITF].reserve();
+    }
+  }
   if (!slot) {
     g_out_dropped++;
     return;
@@ -661,6 +685,7 @@ static bool g_heartbeat = false;
 
 static uint32_t g_bootsel_until = 0; // 0 = released
 
+
 // Also the power-on state, so a reset never leaves the contact held.
 static void bootsel_release(void) {
 #if PROXY_BOOTSEL_ACTIVE_HIGH
@@ -693,6 +718,10 @@ static void bootsel_assert(void) {
 #define PROXY_BOOTSEL_AUTO_MS 6000 // silence this long before trying
 #define PROXY_BOOTSEL_AUTO_MAX 3   // then stop, rather than poking forever
 
+// Much longer wait once a device has been seen: it is probably rebooting into
+// newly flashed firmware, and a reboot can take well over PROXY_BOOTSEL_AUTO_MS.
+#define PROXY_BOOTSEL_REBOOT_GRACE_MS 30000
+
 static void bootsel_service(void) {
   if (g_bootsel_until && (int32_t)(millis() - g_bootsel_until) >= 0) {
     g_bootsel_until = 0;
@@ -713,6 +742,18 @@ static void bootsel_service(void) {
   if (linked || !g_power_is_on) {
     idle_since = millis();
     attempts = 0;
+    g_seen_device = g_seen_device || linked;
+    return;
+  }
+
+  // A key that appeared and then went away is probably rebooting -- most likely
+  // into firmware just flashed through us -- and poking the contact then knocks
+  // it straight back into the bootloader, looping forever. So wait much longer
+  // in that case rather than refusing outright: a hard latch never cleared on a
+  // physical unplug, leaving a genuinely stuck key unrecoverable.
+  uint32_t const quiet_for =
+      g_seen_device ? PROXY_BOOTSEL_REBOOT_GRACE_MS : PROXY_BOOTSEL_AUTO_MS;
+  if ((int32_t)(millis() - (idle_since + quiet_for)) < 0) {
     return;
   }
   if (g_bootsel_until) {
@@ -721,10 +762,6 @@ static void bootsel_service(void) {
   if (attempts >= PROXY_BOOTSEL_AUTO_MAX) {
     return; // tried enough; leave it alone
   }
-  if ((int32_t)(millis() - (idle_since + PROXY_BOOTSEL_AUTO_MS)) < 0) {
-    return;
-  }
-
   attempts++;
   idle_since = millis();
   bootsel_assert();
@@ -880,7 +917,8 @@ static uint16_t const kWs2812Insns[] = {
 static pio_program_t const kWs2812Program = {
     .instructions = kWs2812Insns,
     .length = 4,
-    .origin = -1,
+    .origin = -1,       // let the assembler place it
+    .pio_version = 0,   // RP2040 PIO; named to silence -Wmissing-field-initializers
 };
 
 // Set by whichever core forwarded a report. These are plain variable stores --
@@ -1244,8 +1282,9 @@ static void usb_build_config(bool with_hid) {
       continue;
     }
     g_hid[i].setReportDescriptor(link->desc, link->desc_len);
-    g_hid[i].setBootProtocol(link->known >= 0 ? k_itf[link->known].boot_protocol
-                                              : HID_ITF_PROTOCOL_NONE);
+    g_hid[i].setBootProtocol(link->known >= 0
+                                 ? k_itf[link->known].boot_protocol
+                                 : (uint8_t)HID_ITF_PROTOCOL_NONE);
     g_hid[i].setPollInterval(1);
     // Mirror the device: only offer an interrupt OUT endpoint if it has one.
     g_hid[i].enableOutEndpoint(link->has_out_ep);
