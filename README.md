@@ -22,8 +22,13 @@ responding.
 **Adafruit Feather RP2040 with USB Type A Host** — <https://www.adafruit.com/product/5723>
 
 Nothing else is required: the Type-A host connector, the switchable 5 V supply
-to it, the NeoPixel and the BOOT button are all on the board. Two USB cables in
-total — one to the PC, and the OnlyKey into the Type-A port.
+to it, the NeoPixel and the BOOT button are all on the board.
+
+Both connectors on the board are female, so the whole setup takes **one cable**:
+
+- **PC side** — one USB cable from the PC to the Feather's own port.
+- **Host side** — the OnlyKey's male Type-A plug goes **straight into the
+  board's Type-A socket**. No cable, no adapter.
 
 Pins used, all from the board's variant definition rather than hardcoded:
 
