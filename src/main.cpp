@@ -1096,16 +1096,23 @@ static void bootsel_assert(void) {
 // because the reset is the recovery measured to work every time on a
 // descriptor-less key, while a cold entry sometimes does not.
 //
-// WHY is not established. It is NOT that VBUS cycling fails to power the key
-// down -- that was assumed and is disproved: with VBUS off the key unmounts and
-// sends nothing for 15 s, and on `p` it runs its LED boot sequence. Both
-// recoveries genuinely power-cycle it.
+// WHY is not established, and every theory tried so far has been eliminated:
 //
-// The remaining difference is WHEN the contact is pressed relative to the key's
-// power-up: a reset has GPIO 6 grounded by its reset pull-down THROUGH the
-// power-up and released as this firmware boots, whereas a cold entry powers the
-// key up with the contact released and presses afterwards. Worth testing before
-// anyone tunes the timings below.
+//   "VBUS cycling does not really power the key down" -- disproved. With VBUS
+//   off the key unmounts and sends nothing for 15 s, and on `p` it runs its LED
+//   boot sequence.
+//
+//   "the PIO driving D+/D- back-feeds the key" -- disproved directly. The proxy
+//   is still running during a VBUS-off, so the data lines ARE still driven, and
+//   the key dies anyway.
+//
+//   "GPIO 6's reset pull-down grounds the contact through power-up, which is
+//   what enters the bootloader" -- disproved. During an RP2040 BOOTSEL every
+//   pad sits at reset state for as long as you like, and the key comes back in
+//   APPLICATION mode.
+//
+// So this escalation is empirical, not reasoned. Do not tune the timings below
+// on the strength of any of the above.
 #define PROXY_BOOTSEL_RESET_AFTER 2
 
 // Resets to try before giving up and waiting for a human.

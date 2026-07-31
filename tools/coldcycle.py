@@ -17,11 +17,13 @@ driving D+/D- while the rail is down and back-feeds the key through its
 protection diodes, so it never re-runs its startup. That single fact explains
 why every VBUS-based recovery failed while an RP2040 reset always worked.
 
-It also lands the key in its BOOTLOADER for free. During BOOTSEL, GPIO 6 sits at
-its reset pull-down -- contact pressed. When the proxy boots it calls
-bootsel_release() -- contact released. The bootloader triggers on release, so the
-hardware's own reset behaviour performs exactly the press-and-release a human
-would.
+Where the key LANDS afterwards depends on its firmware, not on this tool:
+
+  valid firmware  -> cold-boots into application mode
+  invalidated     -> bootloader, because there is nowhere else to go
+
+Both observed minutes apart. If you want the bootloader from a working key, use
+`b` afterwards; this tool only guarantees the power cycle.
 
     python coldcycle.py              cycle, then report where the key landed
     python coldcycle.py --hold 8     hold the key unpowered for 8 s

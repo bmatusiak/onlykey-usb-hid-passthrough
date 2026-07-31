@@ -146,9 +146,14 @@ like a passthrough failure; it has been misread as one more than once. Any test
 that enters the bootloader must flash to get back. `tools/soak.py` flashes every
 cycle for this reason.
 
-**Flashing the Feather leaves the key in the bootloader.** The RP2040 reset
-drops VBUS and reverts GPIO 6 to input-with-pull-down, so the key restarts with
-its contact grounded. Expect to re-flash the key after every proxy upload.
+**A Feather reset may leave the key in the bootloader — but only if the key has
+no valid firmware.** A key with valid firmware cold-boots straight back into
+application mode; a key whose firmware was invalidated by an earlier bootloader
+entry has nowhere else to go. Both observed with the same tool minutes apart.
+
+An earlier version of this note blamed GPIO 6's reset pull-down grounding the
+contact through the key's power-up. That was a guess, and the firmware-validity
+explanation covers every observation without it.
 
 **A VBUS power cycle is not a true cold start.** `p`/`0`/`1` drop the key off
 the bus but do not make it re-run its startup. Only a physical unplug does. The

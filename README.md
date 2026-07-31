@@ -723,20 +723,22 @@ true. A long-standing note elsewhere in this project claiming the VBUS commands
 So `PROXY_CUT_DATA_LINES` is **not** needed for power cycling, and the argument
 that made it look necessary does not hold.
 
+**GPIO 6's reset pull-down does not trigger the bootloader either.** During
+`coldcycle.py` the RP2040 sits in its ROM bootloader with every pad at reset
+state, so the contact is grounded through the key's *entire* power-up — and the
+key came back in **application** mode. So "contact grounded across power-up
+enters the bootloader" is out as well.
+
 What remains genuinely unexplained: on a key stuck **descriptor-less**, three
 automatic cold entries, three manual `b` presses and repeated VBUS cycles did
 nothing, while `R` recovered it immediately every time. Both power-cycle the
-key, so the difference is *when the contact is pressed relative to the key's
-power-up*, not whether power was cut:
+key. Neither the data lines nor pull-down timing explains the difference —
+every mechanism proposed so far has been tested and eliminated.
 
-- `R` — the contact is grounded by GPIO 6's reset pull-down **during** the
-  key's power-up, and released as the proxy's firmware boots
-- `B` — the key powers up with the contact **released**, and is pressed
-  afterwards
-
-That is a live question, not a settled one. Until it is answered, automatic
+The honest state of this is **no working theory**. Until there is one, automatic
 recovery escalates to an RP2040 reset after `PROXY_BOOTSEL_RESET_AFTER` (2)
-failed cold entries, because a reset is measured to work every time.
+failed cold entries, purely because a reset is measured to work every time and
+not because anyone knows why.
 
 The recovery also **no longer gives up** after a fixed number of tries —
 stopping left the rig permanently stranded needing a human, which is the
@@ -887,10 +889,17 @@ passthrough failure and has been misread as one more than once — including as
 apparent evidence against a fix that was working correctly. Any procedure that
 enters the bootloader must flash to get back.
 
-Flashing the **Feather** has the same consequence: the RP2040 reset drops VBUS
-and reverts GPIO 6 to input-with-pull-down, so the key restarts with its contact
-grounded and lands in the bootloader. Expect to re-flash the key after every
-proxy upload.
+Flashing or resetting the **Feather** power-cycles the key, so where it lands
+depends entirely on whether its firmware is valid:
+
+- **valid firmware** → cold-boots straight back into **application** mode
+- **invalidated** (an earlier bootloader entry) → **bootloader**, because there
+  is nowhere else to go
+
+Both observed with the same tool minutes apart. An earlier version of this note
+claimed a Feather reset *always* leaves the key in the bootloader, blaming
+GPIO 6's reset pull-down for grounding the contact through the power-up. That
+was a guess; firmware validity explains every observation without it.
 
 **VBUS commands ARE a true power cycle.** This entry previously said the
 opposite — that cutting VBUS did not make the key re-run its startup, mechanism
@@ -902,9 +911,14 @@ unknown. That is **disproved**, by two independent measurements:
 - On `p`, the OnlyKey runs its **LED boot sequence** — the key itself reporting
   a cold start.
 
-The old claim survived a long time because it was never tested; both checks
-above take under a minute. A later theory that the PIO back-feeds the key
-through D+/D− was invented to explain it and is equally unsupported.
+The first of those also **disproves the D+/D− back-feed theory directly**, not
+merely by inference: the proxy is still running throughout a `0`, so the PIO is
+still driving the data lines. VBUS off, data lines driven, key dead. That is the
+exact condition under which back-feed would have to show itself, and it does
+not.
+
+Both checks take under a minute. The old claim survived a long time only because
+nobody ran them.
 
 `PROXY_CUT_DATA_LINES=1` releases the data pads during power-off, on that same
 theory that leakage keeps the device alive. **The theory is dead, so the option
