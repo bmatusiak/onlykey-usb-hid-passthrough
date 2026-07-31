@@ -96,6 +96,44 @@ failure. Exit `0` success, `1` flash error, `2` proxy fault (data was lost).
 
 ## Quirks that will waste your time
 
+**The bootloader triggers on RELEASE of the contact, not while it is held.** It
+is a button press: ground briefly, then let go. Holding it down *prevents* the
+trigger — a fix built on "hold it through enumeration" made things worse.
+
+**And `b` only works on a key that is running firmware**, because the
+application is what notices the press. A stuck descriptor-less key (enumerated,
+right VID/PID, console present, but `itf=0`) has nothing running, so it must be
+power-cycled first. Use **`B`**: cut VBUS 3 s → restore → let it boot 1.5 s →
+press 300 ms → **release**. `R` works too, since a reset power-cycles the key.
+
+**Cutting VBUS is not a real power cycle.** The PIO keeps driving D+/D− while
+the rail is down, back-feeding the key through its protection diodes so it never
+loses power. `R` works every time because an RP2040 reset takes *every* pad
+high-Z at once — that is the only way the key genuinely dies. This is why the
+old note that "VBUS commands don't make the key re-run its startup" was true.
+Releasing the pads deliberately is what `PROXY_CUT_DATA_LINES` tried, and it
+wedges the host stack.
+
+Auto-recovery does the cold entry, backs off to 2 min rather than giving up
+(stranding the rig needs a human, which defeats the point), **escalates to an
+RP2040 reset after `PROXY_BOOTSEL_RESET_AFTER` (2) failures** because that is the
+recovery measured to work, and can be switched off with `A` when poking at the
+board by hand.
+
+On a **healthy** key none of this is needed: grounding the contact from
+application mode reaches HalfKay in ~1.6 s. The dead end only appears when the
+firmware is already damaged — i.e. after a refused flash, which is exactly when
+recovery matters.
+
+**A cold entry blocks core 1 for ~5 s, far longer than the 3 s watchdog**, so it
+sets `g_core1_long_op`. Without that the board reset-loops forever — the reset
+restores the defaults that start the recovery. Any new operation that blocks
+core 1 past the watchdog must set the same flag.
+
+**`0` leaves VBUS off until something turns it back on.** `nothing attached, or
+no VBUS` in the status often means the rail is simply switched off — check
+`5V_EN` in `h` before concluding the key is dead.
+
 **Entering the OnlyKey's bootloader invalidates its application firmware. You
 must re-flash — there is no booting back out.** `halfkay_flash.py --boot-only`
 returns the key to *HalfKay*, not to the application, because HalfKay has

@@ -430,6 +430,10 @@ enum power_cmd_t : uint8_t {
   PWR_CMD_CYCLE,
   PWR_CMD_OFF,
   PWR_CMD_ON,
+  // Power-cycle with the bootloader contact held down throughout, so the key
+  // samples it while booting. See bootsel_cold_entry() for why this is the only
+  // recovery that works on a key with no application firmware.
+  PWR_CMD_BOOTSEL_CYCLE,
 };
 
 // Has any device enumerated since VBUS last came up? Gates auto-recovery: a key
@@ -571,6 +575,77 @@ static void power_apply(bool on) {
 
 // Non-blocking: the host stack must keep running through the off window so it
 // notices the disconnect and re-enumerates on the way back up.
+// How long to let the key boot after VBUS returns, before pressing the contact.
+// Pressing while it is still coming up is the same as not pressing at all.
+#define PROXY_BOOTSEL_COLD_BOOT_MS 1500
+
+// How long the contact is held down for the press itself. The bootloader
+// triggers on RELEASE, so this only has to be long enough to register as a
+// press -- it is not a "hold until something happens" period.
+#define PROXY_BOOTSEL_COLD_HOLD_MS 300
+
+// How long VBUS stays off during a cold entry.
+//
+// Much longer than PROXY_POWER_OFF_MS (750 ms), which is tuned for "make the PC
+// see an unplug" rather than "actually power the key down". A 750 ms cut did
+// NOT reset the key: repeated cold entries at that duration left it stuck
+// descriptor-less, while an RP2040 reset -- which keeps VBUS off far longer,
+// across the whole reset and boot -- recovered it every time. The key evidently
+// rides through a short cut on its own decoupling.
+#define PROXY_BOOTSEL_COLD_OFF_MS 3000
+
+// Defined further down with the rest of the contact handling; needed here.
+static void bootsel_assert(void);
+static void bootsel_release(void);
+
+// Set by core 1 around an operation that legitimately blocks it for longer than
+// PROXY_CORE1_WATCHDOG_MS, so the watchdog does not mistake deliberate work for
+// a wedge and reset the board out from under it.
+static volatile bool g_core1_long_op = false;
+
+// Core 1: the only recovery that works on a key with no application firmware.
+//
+// A Teensy samples its program contact WHILE BOOTING. Entering the bootloader
+// invalidates the application firmware, so afterwards there is no running
+// firmware left to notice a button press -- which means pulsing the contact on
+// a powered-up key can never do anything. Measured: three auto-pulses, three
+// manual pulses and a plain VBUS cycle all failed to recover a descriptor-less
+// key, and a single RP2040 reset recovered it instantly. The reset works only
+// because it happens to drop VBUS while GPIO 6 reverts to input-with-pull-down,
+// holding the contact grounded across the key's power-up.
+//
+// So do that deliberately instead of relying on a side effect: hold the
+// contact, cut VBUS, restore it, and keep holding well past the point where the
+// key has sampled the pin.
+//
+// This blocks core 1 for several seconds, which is far longer than
+// PROXY_CORE1_WATCHDOG_MS. Without telling the watchdog, it fires mid-sequence
+// and resets the board -- and since a reset restores the defaults that started
+// the recovery in the first place, the board reset-loops forever. That happened:
+// a 3 s power-off plus a 4 s hold against a 3 s watchdog, cycling endlessly and
+// taking the console down every time. g_core1_long_op is what stops it.
+static void bootsel_cold_entry(void) {
+  LOGF("[bsel] cold bootloader entry: contact pressed across a power cycle\r\n");
+  g_core1_long_op = true;
+
+  // Power-cycle first, with the contact RELEASED, and let the key boot.
+  power_apply(false);
+  delay(PROXY_BOOTSEL_COLD_OFF_MS);
+  power_apply(true);
+  delay(PROXY_BOOTSEL_COLD_BOOT_MS); // let it come up before pressing anything
+
+  // Then press and release, which is what a human does with the button. The
+  // bootloader triggers on RELEASE, not while held -- holding the contact down
+  // prevents the very thing this is trying to achieve, which is why an earlier
+  // version that held it through enumeration never worked.
+  bootsel_assert();
+  delay(PROXY_BOOTSEL_COLD_HOLD_MS);
+  bootsel_release();
+
+  g_core1_long_op = false;
+  LOGF("[bsel] contact released, key should now enter its bootloader\r\n");
+}
+
 static void power_service(void) {
   uint8_t const cmd = g_power_cmd;
   if (cmd != PWR_CMD_NONE) {
@@ -595,6 +670,9 @@ static void power_service(void) {
       LOGF("[pwr] VBUS on\r\n");
       g_power_off_until = 0;
       power_apply(true);
+      break;
+    case PWR_CMD_BOOTSEL_CYCLE:
+      bootsel_cold_entry();
       break;
     default:
       break;
@@ -926,6 +1004,10 @@ static volatile bool g_out_verbose = false;
 // --------------------------------------------------------------------------
 
 static uint32_t g_bootsel_until = 0; // 0 = released
+// Held indefinitely by the 'G' command until 'g'. Kept separate from the timed
+// hold above so the automatic recovery cannot release a deliberate manual hold
+// out from under whoever is testing with it.
+static volatile bool g_bootsel_held = false;
 
 
 // Also the power-on state, so a reset never leaves the contact held.
@@ -964,7 +1046,31 @@ static void bootsel_assert(void) {
 // newly flashed firmware, and a reboot can take well over PROXY_BOOTSEL_AUTO_MS.
 #define PROXY_BOOTSEL_REBOOT_GRACE_MS 30000
 
+// Longest gap between automatic recovery attempts once they start backing off.
+// Recovery never gives up -- an unattended rig that strands itself is useless --
+// but an empty port must not be power-cycled every few seconds forever, because
+// each cycle re-enumerates the whole device and takes the console with it.
+#define PROXY_BOOTSEL_BACKOFF_MAX_MS 120000
+
+// Cold entries to try before escalating to a full RP2040 reset. Kept low
+// because the reset is the recovery that actually works: cutting VBUS alone
+// leaves the PIO driving D+/D-, which back-feeds the key and stops it ever
+// truly powering down.
+#define PROXY_BOOTSEL_RESET_AFTER 2
+
+// Automatic recovery can be switched off ('A').
+//
+// It power-cycles the key every few seconds while the port is silent, which is
+// right for unattended running but makes the board impossible to experiment
+// with by hand: the console drops with every cycle, and the key never gets to
+// sit powered long enough to poke at. Anything characterising the contact
+// behaviour wants this off.
+static volatile bool g_bootsel_auto = true;
+
 static void bootsel_service(void) {
+  if (g_bootsel_held) {
+    return; // manual hold ('G'); nothing automatic may touch the contact
+  }
   if (g_bootsel_until && (int32_t)(millis() - g_bootsel_until) >= 0) {
     g_bootsel_until = 0;
     bootsel_release();
@@ -980,6 +1086,10 @@ static void bootsel_service(void) {
     linked = linked || g_link[i].mounted;
   }
 
+  if (!g_bootsel_auto) {
+    return; // switched off with 'A' so the board can be poked at by hand
+  }
+
   // A live device, or no power, means there is nothing to recover from.
   if (linked || !g_power_is_on) {
     idle_since = millis();
@@ -993,31 +1103,92 @@ static void bootsel_service(void) {
   // it straight back into the bootloader, looping forever. So wait much longer
   // in that case rather than refusing outright: a hard latch never cleared on a
   // physical unplug, leaving a genuinely stuck key unrecoverable.
-  uint32_t const quiet_for =
+  uint32_t quiet_for =
       g_seen_device ? PROXY_BOOTSEL_REBOOT_GRACE_MS : PROXY_BOOTSEL_AUTO_MS;
+
+  // Back off as attempts pile up.
+  //
+  // Retrying forever at a fixed interval is right for a key that might still
+  // come back, but with nothing attached at all it power-cycles every few
+  // seconds indefinitely -- and since cutting VBUS re-enumerates the whole
+  // device, that takes the console down with it every time and makes the board
+  // almost impossible to talk to. Observed while debugging exactly that.
+  //
+  // So keep trying (never giving up is what makes the rig unattended) but slow
+  // down, up to PROXY_BOOTSEL_BACKOFF_MAX_MS between attempts. A key that is
+  // genuinely coming back is recovered by the first few tries; anything beyond
+  // that is a port with nothing in it, and there is no hurry.
+  if (attempts > 2) {
+    uint32_t const scaled = quiet_for * (attempts - 1);
+    quiet_for = scaled > PROXY_BOOTSEL_BACKOFF_MAX_MS
+                    ? PROXY_BOOTSEL_BACKOFF_MAX_MS
+                    : scaled;
+  }
   if ((int32_t)(millis() - (idle_since + quiet_for)) < 0) {
     return;
   }
   if (g_bootsel_until) {
     return; // already holding the contact
   }
-  if (attempts >= PROXY_BOOTSEL_AUTO_MAX) {
-    return; // tried enough; leave it alone
-  }
   attempts++;
   idle_since = millis();
-  bootsel_assert();
-  g_bootsel_until = millis() + PROXY_BOOTSEL_HOLD_MS;
-  LOGF("[bsel] nothing enumerated in %u ms -- pulsing contact (%u/%u)\r\n",
-       (unsigned)PROXY_BOOTSEL_AUTO_MS, attempts,
-       (unsigned)PROXY_BOOTSEL_AUTO_MAX);
+
+  // Escalate to a full RP2040 reset once the gentler recovery has had a fair
+  // go. This is not a shrug -- a reset is the ONE recovery measured to work
+  // every time on a key that will not come back, and the reason appears to be
+  // that it is the only way the data lines stop being driven.
+  //
+  // Cutting VBUS is not enough on its own: the PIO keeps driving D+/D- while
+  // the rail is down, which back-feeds the key through its protection diodes,
+  // so it never actually loses power and never re-runs its startup. During a
+  // reset every pad goes high-Z at once, the key genuinely dies, and GPIO 6's
+  // reset pull-down grounds the contact as it comes back up.
+  //
+  // Releasing the pads deliberately would be neater, but that is what
+  // PROXY_CUT_DATA_LINES tried and it wedges the host stack -- the state
+  // machines must be torn down first. A reset does that wholesale and is known
+  // good, so use it rather than a clever thing that is not.
+  if (attempts > PROXY_BOOTSEL_RESET_AFTER) {
+    LOGF("[bsel] %u cold entries failed -- resetting the RP2040, which is the "
+         "only recovery that reliably brings a dead key back\r\n",
+         attempts - 1);
+    for (uint8_t i = 0; i < 20 && !g_log_ring.empty(); i++) {
+      drain_log();
+      delay(5);
+    }
+    watchdog_reboot(0, 0, 0);
+    return;
+  }
+
+  // Cold entry, not a pulse.
+  //
+  // This used to just tap the contact, up to PROXY_BOOTSEL_AUTO_MAX times, and
+  // then give up permanently. It could never have worked: a Teensy samples its
+  // program contact WHILE BOOTING, and a key whose application firmware has
+  // been invalidated -- which is exactly the state we are recovering from --
+  // has nothing running to notice a tap. Measured on a stuck key: three auto
+  // pulses, three manual pulses and a plain VBUS cycle all did nothing, while
+  // one cold entry recovered it immediately.
+  //
+  // Also no longer gives up. Stopping after three attempts left the rig
+  // permanently stranded needing a human, which defeats the point of it. Retry
+  // for as long as the port stays silent -- the interval already rate-limits
+  // this to once per PROXY_BOOTSEL_AUTO_MS, and the log says what it is doing.
+  LOGF("[bsel] silent %u ms -- cold bootloader entry (try %u, next in %u ms)\r\n",
+       (unsigned)quiet_for, attempts,
+       (unsigned)(attempts > 1 ? quiet_for * attempts : quiet_for));
+  g_power_cmd = PWR_CMD_BOOTSEL_CYCLE; // core 1 performs it; VBUS is its to touch
 #endif
 }
 
 static void print_help(void) {
   LOGF("commands:\r\n"
-       "  R    reboot RP2040 -> puts the KEY into its bootloader (direct wire)\r\n"
-       "  b    pulse contact (only wakes a key that is not enumerating)\r\n"
+       "  B    COLD bootloader entry: contact held across a power cycle\r\n"
+       "       (the only thing that recovers a key with no firmware)\r\n"
+       "  b    tap contact -- only works on a key that is RUNNING firmware\r\n"
+       "  G/g  ground the contact and HOLD / release it\r\n"
+       "  A    toggle automatic recovery (off = no self power-cycling)\r\n"
+       "  R    reboot RP2040 -> also a cold entry, via the reset pull-down\r\n"
        "  p    power-cycle host port      0 / 1   VBUS off / on\r\n"
        "  i    status                     h       host pins\r\n"
        "  x    stored descriptors         d       live descriptor dump\r\n"
@@ -1117,6 +1288,33 @@ static void console_service(void) {
       g_bootsel_until = millis() + PROXY_BOOTSEL_HOLD_MS;
       LOGF("[bsel] contact held low for %u ms\r\n",
            (unsigned)PROXY_BOOTSEL_HOLD_MS);
+      break;
+    case 'B':
+      // Cold entry: hold the contact across a power cycle. The only thing that
+      // recovers a key whose application firmware is gone, because the contact
+      // is sampled while booting and a tap on a running key needs firmware to
+      // notice it. Use this, not 'b', when the port has gone silent.
+      g_power_cmd = PWR_CMD_BOOTSEL_CYCLE;
+      break;
+    case 'G':
+      // Ground the contact and HOLD it until 'g'. The key needs the contact
+      // still grounded while it enumerates in order to offer its bootloader
+      // descriptors, and any fixed timeout is a guess -- this makes the hold
+      // explicit so the behaviour can be characterised rather than assumed.
+      bootsel_assert();
+      g_bootsel_until = 0; // no timeout: bootsel_service() will not release it
+      g_bootsel_held = true;
+      LOGF("[bsel] contact GROUNDED and held -- 'g' releases it\r\n");
+      break;
+    case 'g':
+      bootsel_release();
+      g_bootsel_held = false;
+      LOGF("[bsel] contact released\r\n");
+      break;
+    case 'A':
+      g_bootsel_auto = !g_bootsel_auto;
+      LOGF("[bsel] automatic recovery %s\r\n",
+           g_bootsel_auto ? "ON" : "off (board will not self-recover)");
       break;
     case 'R':
       // Reboot the RP2040 to put the attached key into ITS bootloader.
@@ -1415,9 +1613,10 @@ static void core1_watchdog_service(void) {
     return;
   }
 
-  // A descriptor dump legitimately holds core 1 in synchronous transfers, so
-  // do not count that time against it.
-  if (g_dump_req) {
+  // Some work legitimately blocks core 1 for longer than the timeout: a
+  // descriptor dump uses synchronous transfers, and a cold bootloader entry
+  // deliberately sits through a power cycle. Neither is a wedge.
+  if (g_dump_req || g_core1_long_op) {
     last_progress = now;
     return;
   }

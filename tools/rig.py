@@ -152,12 +152,19 @@ def enter_bootloader(timeout=90):
             return port
 
         # Either still in the application, or bootloader-but-descriptor-less.
-        # Both want the same thing: a pulse on the contact.
+        # These need DIFFERENT things, and using the wrong one silently does
+        # nothing:
+        #
+        #   running firmware  -> `b`, a tap the application notices
+        #   descriptor-less   -> `B`, a cold entry with the contact held across
+        #                        a power cycle, because the contact is sampled
+        #                        while booting and there is no firmware left to
+        #                        notice a tap
         if pulses >= 5:
             return None
         pulses += 1
-        send(port, "b")
-        time.sleep(7)
+        send(port, "B" if state.get("itf", "0") == "0" else "b")
+        time.sleep(9)  # cold entry includes a full power cycle
 
     return None
 
@@ -225,13 +232,17 @@ def ensure_application(hexfile, timeout=120):
             continue
 
         if state.get("itf") == "0":
-            # Wake it rather than waiting for the proxy's own auto-pulse, which
-            # holds off 30 s once a device has been seen.
+            # Descriptor-less: the contact is sampled while booting, so a tap
+            # does nothing here -- it needs a cold entry with the contact held
+            # across a power cycle. Done here rather than waiting for the
+            # proxy's own recovery, which holds off 30 s once a device has been
+            # seen.
             if pulses >= 4:
-                return "key stays descriptor-less after %d contact pulses" % pulses
+                return ("key stays descriptor-less after %d cold entries"
+                        % pulses)
             pulses += 1
-            send(port, "b")
-            time.sleep(8)
+            send(port, "B")
+            time.sleep(10)
             continue
 
         if state.get("pid") == "0478":

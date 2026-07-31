@@ -144,8 +144,11 @@ Open the COM port at 115200 (`pio device monitor`). Single keypresses, no Enter:
 |---|---|
 | `p` | power-cycle the host port (off 750 ms, on) |
 | `0` / `1` | host port off (stays off) / on |
-| `b` | **pulse the bootloader contact — reboots a running key into HalfKay** |
-| `R` | reboot the RP2040; fallback bootloader entry for an unresponsive key |
+| `b` | press/release the contact — **only works on a key that is RUNNING firmware** |
+| `B` | **cold bootloader entry: power-cycle, let it boot, then press/release** — recovers a key with no firmware |
+| `G` / `g` | ground the contact and hold / release it (characterising only — holding *prevents* the trigger) |
+| `A` | toggle automatic recovery; off stops the board power-cycling itself |
+| `R` | reboot the RP2040; also recovers a stuck key |
 | `i` | status: core health, link state, per-slot counters, button, pins |
 | `h` | raw D+/D− pad levels and the pre-init probe result |
 | `x` | re-print the report descriptors captured from the attached device |
@@ -642,17 +645,93 @@ around it and the VID/PID is adopted. Interface numbering adapts too — HalfKay
 single HID lands at MI_00, so a flashing tool sees the same layout as a
 directly-attached key.
 
-`R` (reboot the RP2040) is a **fallback** for when the key is not responding at
-all. During an RP2040 reset GPIO 18 goes undriven and GPIO 6 reverts to
-input-with-pull-down, so the contact is held grounded across the key restarting.
-Direct-wire only: with a transistor that pull-down holds the gate *off*, so the
-contact is released and the key boots normally.
+#### Recovering a key with no firmware — the `B` cold entry
 
-Observed, without a confirmed mechanism: the `p` / `0` / `1` VBUS commands do
-**not** make the key re-run its startup. Bootloader entry by "hold the contact
-across a VBUS cycle" never worked, and a soft reboot out of HalfKay does not
-reproduce a cold boot either. A physical unplug/replug does. Treat the VBUS
-commands as "drop the device off the bus", not "power it down".
+**The bootloader triggers on RELEASE, not while the contact is held.** It is a
+button press: ground it briefly, then let go. Holding the contact down *prevents*
+the trigger, so "hold it until something happens" is exactly wrong — an attempt
+built on that assumption produced a key that had left application mode and then
+offered no interfaces at all.
+
+The other half: `b` works on a running key because the *application firmware*
+notices the press. Entering the bootloader invalidates that firmware, so a key
+left stuck **descriptor-less** — enumerated, correct VID/PID, console present,
+but `itf=0` — has nothing running to notice anything. It has to be power-cycled
+first so something is there to press.
+
+So the working sequence, which is just what a human does, is:
+
+1. Cut VBUS for `PROXY_BOOTSEL_COLD_OFF_MS` (3 s)
+2. Restore VBUS and **let the key boot** — `PROXY_BOOTSEL_COLD_BOOT_MS` (1.5 s)
+3. Press the contact for `PROXY_BOOTSEL_COLD_HOLD_MS` (300 ms)
+4. **Release** — this is the trigger
+
+That is `B`. Use it, not `b`, whenever the port has gone silent.
+
+##### Why cutting VBUS is not a real power cycle
+
+`B` is often not enough, and the reason matters: **the PIO keeps driving D+/D−
+while the rail is down.** Those lines back-feed the key through its protection
+diodes, so it never actually loses power and never re-runs its startup.
+
+`R` (reboot the RP2040) recovers a stuck key every single time, and this is why:
+a reset takes *every* pad high-Z at once. The data lines stop being driven, the
+key genuinely dies, and GPIO 6's reset pull-down grounds the contact as it comes
+back up. Measured on a genuinely stuck key — three automatic pulses, three manual
+`b` presses, and repeated VBUS cycles at both 750 ms and 3 s all did nothing;
+`R` recovered it immediately, every time.
+
+This also explains a long-standing note in this project that the VBUS commands
+"do not make the key re-run its startup". That was never mysterious. It is the
+data lines.
+
+Releasing the pads deliberately during the cut would be the neat fix, and is
+what `PROXY_CUT_DATA_LINES` attempted — but it wedges the host stack, because
+the PIO state machines have to be torn down first and are not. So rather than
+build on a theory, **automatic recovery escalates to an RP2040 reset after
+`PROXY_BOOTSEL_RESET_AFTER` (2) failed cold entries**, using the mechanism that
+is measured to work rather than the one that ought to.
+
+The recovery also **no longer gives up** after a fixed number of tries —
+stopping left the rig permanently stranded needing a human, which is the
+opposite of the point. It backs off instead, up to
+`PROXY_BOOTSEL_BACKOFF_MAX_MS` (2 min) between attempts, because retrying every
+few seconds against an empty port re-enumerates the whole device each time and
+makes the console unusable.
+
+##### When this actually happens
+
+Worth being precise, because it is easy to over-read: on a **healthy** key,
+grounding the contact from application mode goes straight to HalfKay in about
+1.6 s. Verified both by hand and scripted:
+
+```
+0.834  --- sent 'b' ---
+0.885  [bsel] contact held low for 300 ms
+0.885  [host] device detached: addr 1
+0.885  [host] itf 0..3 unmounted
+0.885  [bsel] contact released
+2.474  --- attached to COM15 ---     16C0:0478, HID bound
+```
+
+The descriptor-less dead end only appeared when the key's firmware was already
+damaged — after a flash that the `piotimeouts` gate had correctly refused. Which
+is exactly the moment recovery matters most, so the handling above earns its
+place even though the common path never touches it.
+
+> **A cold entry blocks core 1 for several seconds**, which is far longer than
+> `PROXY_CORE1_WATCHDOG_MS`. It sets `g_core1_long_op` so the watchdog does not
+> mistake deliberate work for a wedge. Without that the board reset-loops
+> forever: the reset restores the very defaults that start the recovery. This
+> happened, and it takes the console down on every cycle, so it is unpleasant to
+> diagnose from the outside. Any new operation that blocks core 1 past the
+> watchdog must set the same flag.
+
+Note on the VBUS commands: `p` / `0` / `1` alone do not reach the bootloader —
+they only power-cycle. The press-and-release afterwards is what triggers it, and
+that is what `B` adds. `0` also leaves VBUS **off until something turns it back
+on**; a status line reading `nothing attached, or no VBUS` may simply mean the
+rail is switched off, so check `5V_EN` in `h` before concluding the key is dead.
 
 ### The exact flashing procedure
 
@@ -743,6 +822,11 @@ Top of `src/main.cpp`.
 | `PROXY_CORE1_WATCHDOG_MS` | `3000` | Core 1 silence tolerated before core 0 resets the board |
 | `PROXY_HALFKAY_ERASE_MS` | `3000` | Hold-off after a HalfKay block-0 write, for the chip erase |
 | `PROXY_FAULT_DELAY_MS` | `6000` | How long `!3` / `!5` wait, so the fault lands mid-flash |
+| `PROXY_BOOTSEL_COLD_OFF_MS` | `3000` | VBUS off during a cold entry |
+| `PROXY_BOOTSEL_COLD_BOOT_MS` | `1500` | Let the key boot before pressing the contact |
+| `PROXY_BOOTSEL_COLD_HOLD_MS` | `300` | Press duration — release is what triggers the bootloader |
+| `PROXY_BOOTSEL_BACKOFF_MAX_MS` | `120000` | Longest gap between automatic recovery attempts |
+| `PROXY_BOOTSEL_RESET_AFTER` | `2` | Failed cold entries before escalating to an RP2040 reset |
 | `PROXY_CUT_DATA_LINES` | `0` | Unproven experiment — **known to wedge the host stack** |
 
 ---
@@ -844,6 +928,13 @@ interface cannot be cloned.
 - **The key's firmware answering through the proxy**: `okprobe.py` gets
   `Error OnlyKey must be initialized first` back over raw HID at MI_02
   (usage page 0xFFAB) — the key's own firmware, so TX and RX are both proven
+- **Grounding the bootloader contact by hand**, from application mode on a
+  healthy key: straight to `16C0:0478` with the HID interface bound, in ~1.6 s,
+  no descriptor-less state. Confirmed both physically and scripted
+- **The `piotimeouts` gate refusing a real flash.** A genuine desync at block 32
+  aborted the run with *"a block may not have reached the key even though nothing
+  was dropped — this image cannot be trusted. Re-flash."* Before this gate that
+  run would have written a corrupt image and reported success
 - Clean build under `-Wall -Wextra` across all three environments
 
 - **The PIO bounded waits catching a real desync.** During a 25-cycle soak the
@@ -852,6 +943,10 @@ interface cannot be cloned.
   carried on. Under the original unbounded spin the same event hangs core 1
   permanently. This is the failure that used to corrupt firmware flashes
   silently.
+- **Every safety mechanism fired by fault injection**, not inferred: `!1` wedged
+  core 1 and the watchdog reset the board in 2.6 s; `!2` set the sticky drop flag
+  and the status warning; `!5` aborted a flash mid-run; `!3` made the flasher
+  refuse an image; `!4` raised `cloneerr`
 
 **Not yet verified:**
 
