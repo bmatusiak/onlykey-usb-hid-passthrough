@@ -236,14 +236,22 @@ static_assert(PROXY_MAX_HID <= CFG_TUD_HID,
 // and core 0 drains it in loop(). See include/log_ring.h.
 LogRing g_log_ring;
 
+// One message must fit in this buffer. It is a stack buffer and core 1 and the
+// USB IRQ both log through here, so it stays small; split a long message into
+// several LOGF calls rather than growing it. Truncation is reported, not
+// swallowed -- a silently cut log line reads as "that is all there was", which
+// is how a truncated `?` was mistaken for a broken help text.
 static void log_emit(char const *fmt, ...) {
   char buf[192];
   va_list ap;
   va_start(ap, fmt);
-  vsnprintf(buf, sizeof(buf), fmt, ap);
+  int const want = vsnprintf(buf, sizeof(buf), fmt, ap);
   va_end(ap);
   buf[sizeof(buf) - 1] = '\0';
   g_log_ring.write(buf);
+  if (want >= (int)sizeof(buf)) {
+    g_log_ring.write("\r\n[log] ** line truncated **\r\n");
+  }
 }
 
 #define LOGF(...) log_emit(__VA_ARGS__)
@@ -1269,24 +1277,30 @@ static void bootsel_service(void) {
 #endif
 }
 
+// Deliberately many small LOGF calls: log_emit() formats through a 192-byte
+// buffer, so this as one string printed the first three lines and cut the
+// fourth mid-word.
 static void print_help(void) {
   LOGF("commands:\r\n"
        "  B    COLD bootloader entry: contact held across a power cycle\r\n"
-       "       (the only thing that recovers a key with no firmware)\r\n"
-       "  b    tap contact -- only works on a key that is RUNNING firmware\r\n"
-       "  G/g  ground the contact and HOLD / release it\r\n"
-       "  A    toggle automatic recovery (off = no self power-cycling)\r\n"
-       "  R    reboot RP2040 -> also a cold entry, via the reset pull-down\r\n"
-       "  p    power-cycle host port      0 / 1   VBUS off / on\r\n"
-       "  i    status                     h       host pins\r\n"
-       "  x    stored descriptors         d       live descriptor dump\r\n"
-       "  t    3s heartbeat (%s)          ?       help\r\n"
-       "  s    health line (for scripts)  z       zero counters\r\n"
-       "  v    verbose PC->dev reports    U       RP2040 BOOTSEL (reflash me)\r\n"
-       "  !1   wedge core 1 (watchdog)    !2      discard a report now\r\n"
+       "       (the only thing that recovers a key with no firmware)\r\n");
+  LOGF("  b    tap contact -- only works on a key that is RUNNING firmware\r\n"
+       "  G/g  ground the contact and HOLD / release it\r\n");
+  LOGF("  A    toggle automatic recovery (off = no self power-cycling)\r\n"
+       "  R    reboot RP2040 -> also a cold entry, via the reset pull-down\r\n");
+  LOGF("  p    power-cycle host port      0 / 1   VBUS off / on\r\n"
+       "  i    status                     h       host pins\r\n");
+  // %-14s, not a hand-counted run of spaces: the second column starts at 34 on
+  // every other line, and fixed padding sized for "(on)" shifts it when the
+  // heartbeat is off.
+  LOGF("  x    stored descriptors         d       live descriptor dump\r\n"
+       "  t    3s heartbeat %-14s?       help\r\n",
+       g_heartbeat ? "(on)" : "(off)");
+  LOGF("  s    health line (for scripts)  z       zero counters\r\n"
+       "  v    verbose PC->dev reports    U       RP2040 BOOTSEL (reflash me)\r\n");
+  LOGF("  !1   wedge core 1 (watchdog)    !2      discard a report now\r\n"
        "  !3   PIO timeout in 6s          !4      failed interface clone\r\n"
-       "  !5   discard a report in 6s\r\n",
-       g_heartbeat ? "on" : "off");
+       "  !5   discard a report in 6s\r\n");
 }
 
 // One-shot read of the host port pads, independent of the status block.
