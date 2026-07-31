@@ -13,8 +13,8 @@ EVERY CYCLE FLASHES, and that is not a slow-but-thorough choice -- it is the
 only thing that works. Entering the OnlyKey's bootloader invalidates its
 application firmware, so HalfKay has nothing to jump back to and a bare
 `--boot-only` reboot returns the key to the bootloader, not to the application.
-An earlier version of this script used reboot-only and failed on cycle 1 every
-time, which looked convincingly like a passthrough bug and was not one.
+Using reboot-only here fails on cycle 1 every time, and looks convincingly like
+a passthrough bug without being one.
 
 Each cycle costs a full 210-block flash, ~20 s.
 

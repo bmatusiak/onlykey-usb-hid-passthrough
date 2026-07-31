@@ -1,5 +1,16 @@
 # Working on this repo
 
+**[WORKFLOWS.md](WORKFLOWS.md) holds the verified procedures** — build, flash,
+recover, test, capture, inject faults. Every command in it has been run
+successfully on this rig. Start there for "how do I do X"; this file is the
+rules and context behind them.
+
+**Record only true statements** in docs, comments and memory — never a false
+claim, not even as a correction. Retractions decay: "an earlier version claimed
+X, that was wrong" compacts down to "X". To close off a dead theory, state the
+measurement that rules it out, phrased so it stays true if the framing is
+stripped.
+
 A USB HID passthrough on an Adafruit Feather RP2040 with USB Type-A Host. An
 OnlyKey plugs into the host port; the Feather clones it to the PC and forwards
 reports both ways.
@@ -108,15 +119,18 @@ press 300 ms → **release**. `R` works too, since a reset power-cycles the key.
 
 **Cutting VBUS IS a real power cycle** — measured twice: with VBUS off the key
 unmounts and sends nothing for 15 s, and on `p` it runs its LED boot sequence.
-Earlier claims that it was not (and a back-feed-through-D+/D− theory invented to
-explain them) are **disproved**. `PROXY_CUT_DATA_LINES` existed to fix that
-non-problem; treat it as vestigial.
+The proxy keeps running during a VBUS-off, so the data lines are still driven
+and the key dies anyway — they do not sustain it. `PROXY_CUT_DATA_LINES` is
+vestigial; it serves no known purpose.
+
+**GPIO 6's reset pull-down does not enter the bootloader.** In RP2040 BOOTSEL
+every pad sits at reset state through the key's whole power-up, and the key
+returns in application mode.
 
 Still unexplained: on a **descriptor-less** key, `R` recovers it every time and
-`B` does not, even though both power-cycle it. The remaining difference is when
-the contact is pressed — `R` has it grounded *through* the power-up (GPIO 6
-reset pull-down) and released as the proxy boots; `B` powers up released and
-presses after. Open question, not settled.
+`B` does not, even though both power-cycle it. There is **no working theory** —
+power, data lines and pull-down timing are all ruled out above. Do not spend
+time re-deriving those three.
 
 Auto-recovery does the cold entry, backs off to 2 min rather than giving up
 (stranding the rig needs a human, which defeats the point), **escalates to an
@@ -151,13 +165,11 @@ no valid firmware.** A key with valid firmware cold-boots straight back into
 application mode; a key whose firmware was invalidated by an earlier bootloader
 entry has nowhere else to go. Both observed with the same tool minutes apart.
 
-An earlier version of this note blamed GPIO 6's reset pull-down grounding the
-contact through the key's power-up. That was a guess, and the firmware-validity
-explanation covers every observation without it.
-
-**A VBUS power cycle is not a true cold start.** `p`/`0`/`1` drop the key off
-the bus but do not make it re-run its startup. Only a physical unplug does. The
-mechanism is unconfirmed — treat it as an observation, not a theory.
+**A VBUS power cycle IS a true cold start.** `p` makes the key re-run its
+startup — its LED boot sequence runs, and it emits a fresh startup banner on
+seremu (362 reports from zeroed counters). `coldcycle.py` does the same via the
+RP2040 ROM bootloader, where every pad is at reset state and the key is provably
+off the bus.
 
 **`v` is a toggle and it survives re-enumeration.** The RP2040 does not reset
 when the proxy re-enumerates, so verbose logging stays as it was between runs.

@@ -1096,23 +1096,19 @@ static void bootsel_assert(void) {
 // because the reset is the recovery measured to work every time on a
 // descriptor-less key, while a cold entry sometimes does not.
 //
-// WHY is not established, and every theory tried so far has been eliminated:
+// WHY is not established. This escalation is empirical: a reset works every
+// time, and that is the entire justification.
 //
-//   "VBUS cycling does not really power the key down" -- disproved. With VBUS
-//   off the key unmounts and sends nothing for 15 s, and on `p` it runs its LED
-//   boot sequence.
+// Three candidate mechanisms have been ruled out by measurement, so do not
+// spend time re-deriving them:
 //
-//   "the PIO driving D+/D- back-feeds the key" -- disproved directly. The proxy
-//   is still running during a VBUS-off, so the data lines ARE still driven, and
-//   the key dies anyway.
-//
-//   "GPIO 6's reset pull-down grounds the contact through power-up, which is
-//   what enters the bootloader" -- disproved. During an RP2040 BOOTSEL every
-//   pad sits at reset state for as long as you like, and the key comes back in
-//   APPLICATION mode.
-//
-// So this escalation is empirical, not reasoned. Do not tune the timings below
-// on the strength of any of the above.
+//   - VBUS cycling genuinely powers the key down. With VBUS off it unmounts and
+//     sends nothing for 15 s; on `p` it runs its LED boot sequence.
+//   - The data lines do not sustain the key. The proxy keeps running during a
+//     VBUS-off, so D+/D- ARE still driven, and the key dies anyway.
+//   - GPIO 6's reset pull-down does not enter the bootloader. In RP2040 BOOTSEL
+//     every pad sits at reset state through the key's whole power-up, and the
+//     key returns in APPLICATION mode.
 #define PROXY_BOOTSEL_RESET_AFTER 2
 
 // Resets to try before giving up and waiting for a human.
@@ -1220,15 +1216,8 @@ static void bootsel_service(void) {
   // go. This is not a shrug -- a reset is the ONE recovery measured to work
   // every time on a key that will not come back.
   //
-  // Why it beats a cold entry is NOT established, and a previous version of
-  // this comment claimed it confidently and wrongly: that cutting VBUS left the
-  // PIO back-feeding the key so it never lost power. Disproved -- with VBUS off
-  // the key unmounts and sends nothing for 15 s, and on `p` it runs its LED
-  // boot sequence. See PROXY_BOOTSEL_RESET_AFTER for what the real difference
-  // probably is (when the contact is pressed relative to the power-up).
-  //
-  // Using the reset here is therefore an empirical choice, not a reasoned one:
-  // it works every time, and that is the whole justification.
+  // Why it beats a cold entry is not established. See PROXY_BOOTSEL_RESET_AFTER
+  // for the mechanisms already ruled out by measurement.
   if (attempts > PROXY_BOOTSEL_RESET_AFTER) {
     // Count resets in a scratch register, because `attempts` does NOT survive
     // one -- and escalating to a reset that clears the counter is a reset
@@ -1418,16 +1407,14 @@ static void console_service(void) {
     case 'R':
       // Reboot the RP2040 to put the attached key into ITS bootloader.
       //
-      // Fallback for a key that is not responding at all. The VBUS commands DO
-      // power-cycle the key (measured: it unmounts and goes silent with VBUS
-      // off, and runs its LED boot sequence on `p`) -- an earlier comment here
-      // claimed otherwise and was wrong. What a reset adds is that GPIO18 goes
-      // undriven and GPIO6 reverts to input-with-pull-down, holding the contact
-      // grounded while the key
-      // restarts.
+      // Fallback for a key that is not responding at all. It is the recovery
+      // measured to work every time on a descriptor-less key, where the VBUS
+      // cold entry ('B') sometimes does not -- see PROXY_BOOTSEL_RESET_AFTER.
       //
-      // Direct-wire only. With a transistor the same pull-down holds the gate
-      // OFF, so the contact is released and the key boots normally.
+      // During a reset GPIO18 goes undriven and GPIO6 reverts to
+      // input-with-pull-down, so the key is power-cycled with its contact
+      // grounded. Direct-wire only: with a transistor the same pull-down holds
+      // the gate OFF, so the contact is released instead.
       LOGF("[bsel] rebooting RP2040 for key bootloader entry\r\n");
       delay(50); // let the log drain before the port disappears
       watchdog_reboot(0, 0, 0);
