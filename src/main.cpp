@@ -406,6 +406,17 @@ static volatile uint32_t g_out_sent, g_out_dropped;
 // the board is reset.
 static volatile bool g_out_drop_flag;
 
+// Interfaces the device offered that we could not clone: descriptor missing,
+// too large, or no free slot. Cleared when the device detaches, so it always
+// describes the current attachment.
+//
+// Worth counting rather than only logging. A partial clone is a quiet
+// degradation, not a crash: the PC simply sees fewer interfaces than the key
+// has, and since host software locates raw HID by interface NUMBER, a missing
+// interface silently shifts the rest and sends an app talking to the wrong one.
+// That is indistinguishable from a protocol bug from the outside.
+static volatile uint8_t g_clone_failures;
+
 // --------------------------------------------------------------------------
 // VBUS control -- owned by core 1, requested by core 0
 // --------------------------------------------------------------------------
@@ -784,13 +795,13 @@ static void print_status(void) {
 //                            key is in the mode it thinks it is
 static void print_health(void) {
   LOGF("[health] core1=%s drops=%lu dropflag=%u sent=%lu in=%lu indrops=%lu "
-       "piotimeouts=%lu itf=%u mounted=%u vid=%04X pid=%04X\r\n",
+       "piotimeouts=%lu cloneerr=%u itf=%u mounted=%u vid=%04X pid=%04X\r\n",
        g_core1_fatal ? "FATAL" : (core1_alive() ? "ok" : "STALLED"),
        (unsigned long)g_out_dropped, g_out_drop_flag ? 1u : 0u,
        (unsigned long)g_out_sent, (unsigned long)g_in_sent,
        (unsigned long)g_in_dropped, (unsigned long)pio_usb_tx_timeouts,
-       g_host_hid_count, TinyUSBDevice.mounted() ? 1u : 0u, g_dev_vid,
-       g_dev_pid);
+       g_clone_failures, g_host_hid_count,
+       TinyUSBDevice.mounted() ? 1u : 0u, g_dev_vid, g_dev_pid);
 }
 
 // Zero the counters so a run's numbers describe only that run.
@@ -810,6 +821,96 @@ static void reset_counters(void) {
     g_link[i].rearms = 0;
   }
   LOGF("[health] counters zeroed\r\n");
+}
+
+// --------------------------------------------------------------------------
+// Fault injection
+// --------------------------------------------------------------------------
+//
+// Every safety mechanism here exists for a failure that is rare, hard to
+// provoke, and catastrophic when missed. That combination means they are
+// almost never exercised -- the 25-cycle soak passed without the watchdog
+// firing once, so "the tests pass" said nothing at all about whether it works.
+// An untested recovery path is not a recovery path.
+//
+// So each one can be triggered on demand. Two keys are required (`!` then a
+// digit) so a stray byte on the console cannot fire one: the console is the
+// rig's control channel and single characters there already power-cycle the
+// port and reboot the board.
+//
+//   !1  wedge core 1            -> the watchdog must reset the board
+//   !2  discard a report now    -> sticky drop flag, LED, status warning
+//   !3  PIO timeout in 6 s      -> lands mid-flash; flasher must refuse the image
+//   !4  failed interface clone  -> cloneerr, LED
+//   !5  discard a report in 6 s -> lands mid-flash; flasher must abort
+//
+// !3 and !5 are deferred because the flasher holds the console for its own
+// health checks while it runs, so there is no way to inject during a flash from
+// outside. Arming first and letting the fault land mid-transfer is the only way
+// to prove those gates.
+//
+// Note the difference between !2 and !5. A drop flag left over from an EARLIER
+// run must not block a new flash -- the flasher zeroes the counters at start,
+// which is the documented way to begin a clean run. What must abort a flash is
+// a drop that happens DURING it. Only !5 tests that.
+static volatile bool g_fault_arm;         // next console byte selects a fault
+static volatile bool g_fault_wedge;       // core 1 spins forever when set
+static volatile uint32_t g_fault_pio_at;  // deferred PIO-timeout injection
+static volatile uint32_t g_fault_drop_at; // deferred dropped-report injection
+
+#define PROXY_FAULT_DELAY_MS 6000
+
+static void fault_service(void) {
+  if (g_fault_pio_at && (int32_t)(millis() - g_fault_pio_at) >= 0) {
+    g_fault_pio_at = 0;
+    pio_usb_tx_timeouts++;
+    LOGF("[fault] injected a PIO timeout (now %lu)\r\n",
+         (unsigned long)pio_usb_tx_timeouts);
+  }
+  if (g_fault_drop_at && (int32_t)(millis() - g_fault_drop_at) >= 0) {
+    g_fault_drop_at = 0;
+    g_out_dropped++;
+    g_out_drop_flag = true;
+    LOGF("[fault] injected a dropped report (drops=%lu)\r\n",
+         (unsigned long)g_out_dropped);
+  }
+}
+
+static void fault_select(char which) {
+  g_fault_arm = false;
+  switch (which) {
+  case '1':
+    LOGF("[fault] wedging core 1 -- the watchdog should reset us in %u ms\r\n",
+         (unsigned)PROXY_CORE1_WATCHDOG_MS);
+    g_fault_wedge = true;
+    break;
+  case '2':
+    g_out_dropped++;
+    g_out_drop_flag = true;
+    LOGF("[fault] discarded a report (drops=%lu)\r\n",
+         (unsigned long)g_out_dropped);
+    break;
+  case '3':
+    g_fault_pio_at = millis() + PROXY_FAULT_DELAY_MS;
+    LOGF("[fault] PIO timeout armed for %u ms from now\r\n",
+         (unsigned)PROXY_FAULT_DELAY_MS);
+    break;
+  case '4':
+    g_clone_failures++;
+    LOGF("[fault] failed an interface clone (cloneerr=%u)\r\n",
+         g_clone_failures);
+    break;
+  case '5':
+    g_fault_drop_at = millis() + PROXY_FAULT_DELAY_MS;
+    LOGF("[fault] dropped report armed for %u ms from now\r\n",
+         (unsigned)PROXY_FAULT_DELAY_MS);
+    break;
+  default:
+    LOGF("[fault] unknown fault '%c' -- 1=wedge 2=drop 3=pio 4=clone "
+         "5=drop-in-6s\r\n",
+         which);
+    break;
+  }
 }
 
 // When set, status repeats on its own every 3 s. Off by default so the log
@@ -922,7 +1023,10 @@ static void print_help(void) {
        "  x    stored descriptors         d       live descriptor dump\r\n"
        "  t    3s heartbeat (%s)          ?       help\r\n"
        "  s    health line (for scripts)  z       zero counters\r\n"
-       "  v    verbose PC->dev reports    U       RP2040 BOOTSEL (reflash me)\r\n",
+       "  v    verbose PC->dev reports    U       RP2040 BOOTSEL (reflash me)\r\n"
+       "  !1   wedge core 1 (watchdog)    !2      discard a report now\r\n"
+       "  !3   PIO timeout in 6s          !4      failed interface clone\r\n"
+       "  !5   discard a report in 6s\r\n",
        g_heartbeat ? "on" : "off");
 }
 
@@ -939,7 +1043,19 @@ static void print_host_pins(void) {
 
 static void console_service(void) {
   while (PROXY_LOG.available()) {
-    switch (PROXY_LOG.read()) {
+    int const key = PROXY_LOG.read();
+
+    // Second byte of a fault-injection sequence. Consumed here so the digit
+    // cannot also be read as a power command.
+    if (g_fault_arm) {
+      fault_select((char)key);
+      continue;
+    }
+
+    switch (key) {
+    case '!':
+      g_fault_arm = true; // next byte selects the fault
+      break;
     case 'p':
     case 'P':
       g_power_cmd = PWR_CMD_CYCLE;
@@ -1348,6 +1464,9 @@ static bool led_fault(void) {
   if (g_out_drop_flag) {
     return true; // sticky until reset: the PC was told a lie and cannot be told
   }
+  if (g_clone_failures) {
+    return true; // an interface the key offered is missing from what the PC sees
+  }
   if (!g_power_is_on) {
     return false; // VBUS deliberately cut; nothing is expected to be up
   }
@@ -1643,6 +1762,7 @@ void loop() {
   button_service();
   led_service();
   pixel_service(); // core 0 only: the sole place the pixel PIO is touched
+  fault_service();
   core1_watchdog_service(); // last: it may not return
 }
 
@@ -1966,6 +2086,13 @@ void setup1() {
 }
 
 void loop1() {
+  // Fault injection: stop advancing the tick counter, exactly as a real wedge
+  // inside USBHost.task() does. Core 0 keeps running and answering the PC,
+  // which is what made the real thing so hard to spot.
+  while (g_fault_wedge) {
+    tight_loop_contents();
+  }
+
   g_core1_ticks++; // liveness, watched by core 0
   g_core1_phase = C1_HOST_TASK;
   USBHost.task();
@@ -2030,6 +2157,10 @@ void tuh_umount_cb(uint8_t daddr) {
   if (g_dev_addr == daddr) {
     g_dev_addr = 0;
   }
+  // Clone failures describe the attachment that just went away, so clear them
+  // here rather than letting a previous device's problems be reported against
+  // the next one.
+  g_clone_failures = 0;
   LOGF("[host] device detached: addr %u\r\n", daddr);
 }
 
@@ -2044,6 +2175,7 @@ void tuh_hid_mount_cb(uint8_t daddr, uint8_t idx, uint8_t const *desc_report,
   if (!desc_report || !desc_len) {
     // Descriptors larger than CFG_TUH_ENUMERATION_BUFSIZE are not delivered.
     LOGF("[host] no report descriptor available -- cannot map interface\r\n");
+    g_clone_failures++;
     return;
   }
 
@@ -2055,6 +2187,7 @@ void tuh_hid_mount_cb(uint8_t daddr, uint8_t idx, uint8_t const *desc_report,
   if (desc_len > PROXY_MAX_DESC_LEN) {
     LOGF("[host] descriptor %u bytes exceeds %u -- cannot clone\r\n", desc_len,
          (unsigned)PROXY_MAX_DESC_LEN);
+    g_clone_failures++;
     return;
   }
 
@@ -2070,6 +2203,7 @@ void tuh_hid_mount_cb(uint8_t daddr, uint8_t idx, uint8_t const *desc_report,
   if (slot < 0) {
     LOGF("[host] no free slot for addr %u idx %u -- raise PROXY_MAX_HID\r\n",
          daddr, idx);
+    g_clone_failures++;
     return;
   }
 
@@ -2126,6 +2260,9 @@ void tuh_hid_report_received_cb(uint8_t daddr, uint8_t idx,
       g_link[i].in_count++;
       in_report_t *slot = g_inq[i].reserve();
       if (!slot) {
+        // Should now be unreachable: arm_service() only requests a report when
+        // there is a slot free, and nothing else arms this interface. If this
+        // ever fires again, the flow control has been broken somewhere.
         g_in_dropped++;
       } else {
         if (len > sizeof(slot->data)) {
@@ -2139,8 +2276,22 @@ void tuh_hid_report_received_cb(uint8_t daddr, uint8_t idx,
     }
   }
 
-  // Re-arm immediately or the interface goes silent after one report.
-  tuh_hid_receive_report(daddr, idx);
+  // Deliberately NOT re-arming here.
+  //
+  // This used to call tuh_hid_receive_report() unconditionally, which quietly
+  // defeated the flow control in arm_service(). That function refuses to ask
+  // for a report unless a queue slot is free -- the whole point being that an
+  // unrequested report stays in the device, which is real USB back-pressure,
+  // whereas a received one can only be dropped. Re-arming here asked for the
+  // next report regardless, so a queue that could not drain (the PC detached
+  // mid-transition, say) overflowed and lost reports. Measured: 12 lost across
+  // one test run.
+  //
+  // The comment this replaces claimed the interface goes silent without it.
+  // That was true when arm_service() armed only once per mount, but it now
+  // keeps a request outstanding at all times, so it re-arms as soon as there is
+  // somewhere to put the data. tuh_hid_receive_ready() is false while a request
+  // is pending, so the two cannot race.
 }
 
 } // extern "C"

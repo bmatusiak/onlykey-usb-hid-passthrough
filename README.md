@@ -151,10 +151,30 @@ Open the COM port at 115200 (`pio device monitor`). Single keypresses, no Enter:
 | `x` | re-print the report descriptors captured from the attached device |
 | `d` | live descriptor dump straight off the device |
 | `t` | toggle the 3-second status heartbeat |
+| `s` | **one-line machine-readable health — what scripts gate on** |
+| `z` | zero the counters and clear the sticky drop flag |
+| `v` | toggle per-report logging of forwarded host→device traffic |
+| `U` | put the **RP2040** into BOOTSEL, so the proxy can be reflashed |
 | `?` | help |
 
+`s` is the scripting interface; `i` is for people and its layout is not stable
+enough to parse:
+
+```
+[health] core1=ok drops=0 dropflag=0 sent=213 in=947 indrops=0 \
+         piotimeouts=0 cloneerr=0 itf=4 mounted=1 vid=1D50 pid=60FC
+```
+
+Every field is something that, if wrong, means bytes did not arrive.
+`tools/halfkay_flash.py` reads this between batches and aborts on the spot.
+
+`!` followed by a digit injects a fault — see *fault injection* below. Two keys
+so a stray console byte cannot fire one.
+
 The console disappears for ~2 s during any power transition, because the whole
-USB device re-enumerates. It always comes back.
+USB device re-enumerates. It always comes back. **Its COM number changes** with
+the key's mode, since the proxy adopts the key's VID/PID: look it up, never
+cache it. And only one process may hold it at a time.
 
 ### BOOT button (GPIO 7)
 
@@ -263,13 +283,47 @@ Faithful to `teensy_loader_cli`: 3 address bytes + 61 pad + 1024-byte block,
 always sends block 0 to trigger the chip erase and waits 3 s after it, skips
 blank blocks, and finishes with the `FF FF FF` reboot packet.
 
-**After any flash, check `PC->dev` in the `i` output.** It must read
-`210 sent, 0 dropped` (or whatever the block count is) with **zero drops** — see
-*back-pressure* below for why a drop there means a corrupted image rather than a
-lost keystroke.
+**It fails fast.** Flashing through the proxy means a successful
+`HidD_SetOutputReport` proves nothing: the proxy ACKs the control transfer before
+it knows whether it can forward the report, so a wedged host core makes every
+write "succeed" while the key receives nothing. The flasher therefore watches the
+proxy's own `s` health line over the console — auto-detected as the CDC sharing
+the key's VID/PID, which a real key does not have — refuses to start if `core1`
+is not `ok`, checks every 16 blocks, and **aborts at the failure** rather than
+finishing and reporting a success it cannot substantiate.
+
+Exit codes: `0` success, `1` flash error, `2` proxy fault (data was lost). Use
+`--no-health` for a directly-attached key.
 
 The official Teensy Loader GUI works through the proxy too; the CLI tool just
 makes it repeatable.
+
+---
+
+## Tooling
+
+Everything is scriptable, because the rig is meant to run unattended. If a
+procedure needs someone to press something, that is a gap to close.
+
+| Tool | What it does |
+|---|---|
+| [`selftest.py`](tools/selftest.py) | 12 scenarios, fail-fast, prints the `i` block at the failure |
+| [`soak.py`](tools/soak.py) | Bootloader ↔ application cycling, full flash each cycle |
+| [`halfkay_flash.py`](tools/halfkay_flash.py) | Flash the key, with proxy health monitoring |
+| [`okprobe.py`](tools/okprobe.py) | Ask the key a real question and check it answers |
+| [`console.py`](tools/console.py) | The one sanctioned way to hold the console |
+| [`touch1200.py`](tools/touch1200.py) | Put the **Feather** into BOOTSEL — no button press |
+| [`rig.py`](tools/rig.py) / [`winhid.py`](tools/winhid.py) | Shared console and HID plumbing |
+
+Two rules the helpers exist to enforce. **Only one process may hold the console**
+— a second opener gets `PermissionError(13)` and the capture is lost, which cost
+two runs. And **the console's COM number moves** when the key changes mode, since
+the proxy adopts its VID/PID and re-enumerates, so it is always looked up, never
+cached.
+
+`winhid.py` reads with overlapped I/O and a real timeout. A blocking `ReadFile`
+on a device that never sends anything waits forever, and a harness that can hang
+defeats the point of the exercise.
 
 ---
 
@@ -489,6 +543,44 @@ firmware-sized reports — an ordinary 64-byte report beginning `00 00 00` is
 commonplace and must not stall the queue for three seconds. The reboot command
 is `FF FF FF`, so it is never mistaken for this.
 
+### Fault injection
+
+Every safety mechanism here exists for a failure that is rare, hard to provoke,
+and catastrophic when missed. That combination means they are almost never
+exercised: a 25-cycle soak and 14 scenarios fired the watchdog **zero** times.
+Every green run proved the happy path and said nothing about whether the
+recovery paths work at all. An untested recovery path is not a recovery path.
+
+So each one can be triggered on demand. Two keys (`!` then a digit), so a stray
+byte on the console cannot fire one — single characters there already
+power-cycle the port and reboot the board.
+
+| Key | Injects | Proves |
+|---|---|---|
+| `!1` | Core 1 stops ticking | The watchdog resets the board and it recovers |
+| `!2` | A discarded report | Sticky flag, LED, status warning, `z` clears it |
+| `!3` | PIO timeout in 6 s | Lands mid-flash — the flasher must refuse the image |
+| `!4` | A failed interface clone | `cloneerr`, LED, and that a detach clears it |
+| `!5` | A dropped report in 6 s | Lands mid-flash — the flasher must abort |
+
+`!1` stops core 1's tick counter in `loop1()`, which is the same signature as a
+real hang inside `USBHost.task()` — core 0 still running, still answering the
+PC. That is what made the original bug so expensive, and it is now one
+keystroke.
+
+`!3` and `!5` are deferred by 6 s on purpose: the flasher holds the console for
+its own health checks while it runs, so there is no way to inject during a flash
+from outside. Arming first and letting the fault land mid-transfer is the only
+way to prove those gates fire.
+
+Note the difference between `!2` and `!5`. A drop flag left over from an
+**earlier** run must not block a new flash — the flasher zeroes the counters at
+start, which is the documented way to begin a clean run. What must abort a flash
+is a drop **during** it.
+
+Measured: `!1` wedged core 1 and the board reset 2.6 s later with counters
+zeroed and all four interfaces back.
+
 ### IN endpoint arming
 
 Interfaces are polled only after `PROXY_ARM_DELAY_MS` (500 ms), so a device that
@@ -500,6 +592,29 @@ callback to re-arm; a single failed re-arm silenced that interface permanently,
 which stalled forwarding after a few hundred reports. `tuh_hid_receive_ready()`
 is false while a request is pending, so this only re-issues when the chain has
 genuinely broken. The `rearm` counter in `i` shows when that happens.
+
+**Only `arm_service()` may arm an interface**, and it refuses unless a queue
+slot is free:
+
+```c
+if (!g_inq[i].reserve()) continue;   // don't ask for data we cannot store
+```
+
+That is the whole flow-control guarantee. An **unrequested** report stays in the
+device — real USB back-pressure — whereas a **received** one can only be
+dropped.
+
+`tuh_hid_report_received_cb()` used to end with an unconditional
+`tuh_hid_receive_report()`, which defeated that guarantee one line later: it
+asked for the next report regardless of queue space, so a queue that could not
+drain (the PC detached mid-transition, say) overflowed. Measured at **12 lost
+device→PC reports across a single test run**, on the FIDO2 and raw-HID path
+among others.
+
+The comment defending it — "re-arm immediately or the interface goes silent" —
+was true when `arm_service()` armed once per mount. It stopped being true when
+that changed, and the now-harmful line outlived its justification. `indrops` in
+the health line is the check; it must be zero.
 
 ### Entering the key's bootloader
 
@@ -627,6 +742,7 @@ Top of `src/main.cpp`.
 | `PROXY_LED_FAULT_MS` | `2000` | How long a fault must persist before GPIO 13 lights |
 | `PROXY_CORE1_WATCHDOG_MS` | `3000` | Core 1 silence tolerated before core 0 resets the board |
 | `PROXY_HALFKAY_ERASE_MS` | `3000` | Hold-off after a HalfKay block-0 write, for the chip erase |
+| `PROXY_FAULT_DELAY_MS` | `6000` | How long `!3` / `!5` wait, so the fault lands mid-flash |
 | `PROXY_CUT_DATA_LINES` | `0` | Unproven experiment — **known to wedge the host stack** |
 
 ---
@@ -723,9 +839,11 @@ interface cannot be cloned.
   and are byte-identical (`id=0 type=2 len=1088`, `FF FF FF 00…`)
 - **The erase hold-off** — retries across the chip-erase window went from ~390 to
   zero, one log line per delivered report
-- **Repeated bootloader ↔ application cycling under `tools/soak.py`**, each cycle
-  a full 210-block flash, with `core1=ok`, `drops=0` and `piotimeouts=0` checked
-  after every one
+- **25 consecutive bootloader ↔ application cycles** under `tools/soak.py` in
+  564 s — 50 mode transitions, ~5,250 blocks, ending `drops=0 indrops=0 itf=4`
+- **The key's firmware answering through the proxy**: `okprobe.py` gets
+  `Error OnlyKey must be initialized first` back over raw HID at MI_02
+  (usage page 0xFFAB) — the key's own firmware, so TX and RX are both proven
 - Clean build under `-Wall -Wextra` across all three environments
 
 - **The PIO bounded waits catching a real desync.** During a 25-cycle soak the

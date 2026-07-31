@@ -195,6 +195,16 @@ class ProxyHealth:
         self.ser = None
         self.port = port
         self.lost = False
+        # PIO bus timeouts at the start of the run. Any increase during a flash
+        # invalidates the image.
+        #
+        # A timeout means a bounded wait in Pico-PIO-USB gave up and ABANDONED
+        # the transaction -- the block may never have reached the key, while
+        # `sent` already counted it. So zero drops is not sufficient: a run can
+        # report 210 sent / 0 dropped and still write a corrupt image, which is
+        # exactly what happened before this check existed. The give-up is what
+        # stops the stack hanging; it is not a guarantee the data landed.
+        self.baseline_timeouts = None
         # Set once a reboot has been sent. After that the console is EXPECTED to
         # disappear -- rebooting the key re-enumerates the proxy along with it --
         # so losing the port stops being evidence of a fault and becomes
@@ -274,6 +284,18 @@ class ProxyHealth:
             raise ProxyFault(
                 "%s: proxy host core is %s -- nothing is reaching the key"
                 % (context, health.get("core1")))
+
+        now = health.get("piotimeouts")
+        if now is not None:
+            if self.baseline_timeouts is None:
+                self.baseline_timeouts = now
+            elif now != self.baseline_timeouts:
+                raise ProxyFault(
+                    "%s: the PIO bus desynced during this flash "
+                    "(piotimeouts %s -> %s). A transaction was abandoned, so a "
+                    "block may not have reached the key even though nothing was "
+                    "dropped -- this image cannot be trusted. Re-flash."
+                    % (context, self.baseline_timeouts, now))
         return health
 
     def close(self):
@@ -400,6 +422,10 @@ def main():
                       % before.get("core1"))
                 return 2
             else:
+                # Remember the PIO timeout count now: `z` deliberately does not
+                # clear it (it lives in the USB library, not our counters), so
+                # the baseline is captured rather than reset.
+                health.baseline_timeouts = before.get("piotimeouts")
                 health.zero()
 
         if args.boot_only:

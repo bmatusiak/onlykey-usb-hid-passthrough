@@ -63,6 +63,24 @@ Key commands: `i` status · `s` health line · `z` zero counters · `b` put the
 **key** into its bootloader · `p`/`0`/`1` power · `v` verbose OUT · `U` Feather
 BOOTSEL · `?` help.
 
+**Fault injection** (`!` then a digit — two keys so a stray byte cannot fire
+one). These exist because the safety mechanisms are otherwise never exercised:
+25 soak cycles and 14 scenarios fired the watchdog zero times, so a green run
+proved only the happy path.
+
+| Key | Injects | Proves |
+|---|---|---|
+| `!1` | Core 1 stops ticking | Watchdog resets the board, recovers |
+| `!2` | A discarded report | Sticky flag, LED, status warning |
+| `!3` | PIO timeout in 6 s | Mid-flash — flasher refuses the image |
+| `!4` | A failed interface clone | `cloneerr`, LED |
+| `!5` | A dropped report in 6 s | Mid-flash — flasher aborts |
+
+`!3`/`!5` are deferred because the flasher holds the console while it runs, so
+there is no way to inject during a flash from outside. A stale drop flag must
+NOT block a new flash (the flasher zeroes counters at start); only a drop
+*during* a flash aborts it.
+
 ## Flash the OnlyKey through the proxy
 
 ```powershell
@@ -107,6 +125,21 @@ zero them first or you will attribute one run's numbers to another.
 while the control pipe is busy and are not logged, so line count equals reports
 delivered.
 
+**`piotimeouts` is a correctness signal, not a curiosity.** A timeout means a
+bounded wait in Pico-PIO-USB gave up and **abandoned** the transaction, so the
+data may never have reached the key — while `sent` already counted it. Zero
+drops is therefore *not* sufficient proof of a good flash: a run can report
+`210 sent, 0 dropped` and still write a corrupt image. `halfkay_flash.py`
+baselines this counter and exits 2 if it moves. Retry the flash; do not
+carry on. (`z` does not clear it — it lives in the USB library, not our
+counters.)
+
+**Enumerating is not being ready.** Straight after a flash the key is still
+running its startup — seremu visibly streams its banner — and raw HID does not
+answer for a few seconds. Even on a settled key the *first* query after opening
+the interface usually gets no reply and the second works. Always retry before
+concluding a key is dead; `okprobe.py --settle` does this.
+
 ## Hard rules
 
 - **Only core 1 calls `tuh_*`; only core 0 calls `tud_*`/`TinyUSBDevice`.**
@@ -119,21 +152,39 @@ delivered.
   drains it. Writing to CDC from an IRQ deadlocks the device stack.
 - **A dropped OUT report is silent corruption**, because the host was ACKed
   before we knew we could forward it. Never make a drop quieter.
+- **Only `arm_service()` may arm an IN endpoint**, and only when a queue slot is
+  free. An unrequested report stays in the device — real USB back-pressure —
+  while a received one can only be dropped. `tuh_hid_report_received_cb()` must
+  **not** re-arm: doing so defeated the guarantee and lost 12 device→PC reports
+  in one test run. `indrops` must be zero.
 
 ## Verifying a change
 
 ```powershell
-& $PY tools\soak.py 25     # bootloader <-> application, full flash each cycle
+& $PY tools\selftest.py            # 12 scenarios, fail-fast
+& $PY tools\selftest.py --list     # what they are
+& $PY tools\selftest.py -k flash   # just the flashing ones
+& $PY tools\soak.py 25             # stability: 25 bootloader<->app cycles
+& $PY tools\okprobe.py --count 20  # raw-HID round trips only
 ```
 
-Drives the window the host stack used to wedge in — detach and re-enumeration —
-and checks `core1`, `drops` and `piotimeouts` after every cycle. Stops at the
-first failure with the cycle number and the phase core 1 died in. ~20 s/cycle.
+`selftest.py` stops at the first failure and prints the `i` block, because the
+phase core 1 died in is the most useful thing to know and it is gone the moment
+anything else touches the device. Scenarios that enter the bootloader always
+flash back, so the rig is left usable.
+
+**The check that actually matters is `flash_then_key_responds`.** HalfKay has no
+read-back, so an image cannot be verified directly, and "210 blocks sent" is
+exactly the claim that was false while the key received nothing. The honest
+substitute is end-to-end: flash, reboot, and require the firmware to boot and
+answer over raw HID. An "uninitialized" reply is a pass — that is the key's own
+firmware talking.
 
 `PC->dev` and `dev->PC` must both read `N sent, 0 dropped` after **both** a
 firmware flash *and* a burst of raw-HID traffic. Those exercise opposite halves
 of the back-pressure rule and a change can easily fix one while breaking the
-other.
+other — which is why `hid_round_trip_integrity` and the flash scenarios are
+separate tests.
 
 ## The core 1 hang
 
