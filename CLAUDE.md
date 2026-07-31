@@ -223,6 +223,10 @@ substitute is end-to-end: flash, reboot, and require the firmware to boot and
 answer over raw HID. An "uninitialized" reply is a pass — that is the key's own
 firmware talking.
 
+`rearm` is **not** a fault signal — it tracks `in` almost exactly now that
+`arm_service()` is the sole armer. Watch `drops`, `indrops`, `dropflag`,
+`cloneerr` and a rising `piotimeouts` instead.
+
 `PC->dev` and `dev->PC` must both read `N sent, 0 dropped` after **both** a
 firmware flash *and* a burst of raw-HID traffic. Those exercise opposite halves
 of the back-pressure rule and a change can easily fix one while breaking the

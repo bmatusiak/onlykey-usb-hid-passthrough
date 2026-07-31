@@ -626,8 +626,14 @@ has just enumerated is not hit with an IN request while still initialising.
 once. An earlier version armed a single time per mount and relied on the report
 callback to re-arm; a single failed re-arm silenced that interface permanently,
 which stalled forwarding after a few hundred reports. `tuh_hid_receive_ready()`
-is false while a request is pending, so this only re-issues when the chain has
-genuinely broken. The `rearm` counter in `i` shows when that happens.
+is false while a request is pending, so this only re-issues once the previous
+report has actually arrived.
+
+**The `rearm` counter is not a fault signal.** It once was, back when the report
+callback did the re-arming and `arm_service()` only stepped in after a broken
+chain. Now that `arm_service()` is the sole armer it increments on every normal
+re-arm, so it tracks `in` almost exactly — 2502 in / 2502 rearm on a keyboard
+during a backup is healthy, not alarming. `indrops` is the signal to watch.
 
 **Only `arm_service()` may arm an interface**, and it refuses unless a queue
 slot is free:
@@ -981,18 +987,34 @@ interface cannot be cloned.
   and the status warning; `!5` aborted a flash mid-run; `!3` made the flasher
   refuse an image; `!4` raised `cloneerr`
 
+- **The OnlyKey working as an OnlyKey, through the proxy, with its own software.**
+  All four interfaces exercised by real applications in one session — a slot
+  label configured in the OnlyKey app (raw HID), an encrypted backup typed into
+  Notepad as **2502 keystrokes** (keyboard), and a **WebAuthn login at
+  webauthn.io** (FIDO2) — ending:
+
+  ```
+  slot 0 keyboard: 2502 in     slot 1 fido2:  68 in
+  slot 2 rawhid:     97 in     slot 3 seremu: 2233 in
+  dev->PC : 6034 sent, 0 dropped
+  PC->dev :  272 sent, 0 dropped
+  ```
+
+  This is the evidence counters alone cannot give: the host does not just
+  receive the bytes, it *interprets* them correctly — a browser completed a
+  real WebAuthn ceremony and an app read back what it wrote.
+
 **Not yet verified:**
 
 - **The watchdog firing on a real wedge.** Still no wedge to hand — which is now
   the point, since the known cause is fixed. It remains a backstop for hangs
   that have not been met yet.
-- **A WebAuthn / FIDO2 login through the proxy** (expect yellow)
-- **Keystrokes from the OnlyKey reaching the PC** (expect a white pulse)
-
-Report counters prove bytes move; they cannot prove the host *interprets* them.
 
 **Notes on reading the counters:** `dev->PC` sitting still is not necessarily a
 fault — the keyboard, FIDO2 and raw HID interfaces only send on user action, and
-seremu goes quiet once it has flushed its startup output. The `rearm` column is
-the real health signal: non-zero means an IN request chain broke and had to be
-restarted.
+seremu goes quiet once it has flushed its startup output.
+
+`rearm` is **not** a fault signal (it once was; see *IN endpoint arming*). It now
+tracks `in` almost exactly because `arm_service()` is the sole armer. The
+signals that matter are `drops`, `indrops`, `dropflag`, `cloneerr` and a rising
+`piotimeouts`.
