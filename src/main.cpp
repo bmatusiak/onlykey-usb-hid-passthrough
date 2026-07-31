@@ -148,13 +148,28 @@ extern "C" volatile uint32_t pio_usb_tx_timeouts;
 // continuation frames back to back), OUT is PC->device.
 #define PROXY_IN_QUEUE_LEN 32
 // Each slot is PROXY_MAX_OUT_REPORT bytes to accommodate firmware blocks, so
-// depth costs real RAM -- but too shallow silently corrupts a firmware write.
-#define PROXY_OUT_QUEUE_LEN 8
+// depth costs real RAM (4 interfaces x this x 1152 bytes) -- but too shallow
+// silently corrupts a firmware write.
+//
+// Raised from 8 after the Teensy Loader GUI lost 22 blocks in a single flash.
+// Eight PIO desyncs during that run each abandoned a transaction, core 1 fell
+// behind draining, the queue filled, and reports were dropped -- after the PC
+// had already been ACKed. The key enumerated but ran a corrupt image.
+#define PROXY_OUT_QUEUE_LEN 16
 
 // How long set_report_thunk() will wait for a free slot before giving up. The
 // host has already been told the transfer succeeded by the time we could
 // refuse, so waiting is the only way to avoid losing data.
-#define PROXY_OUT_BLOCK_MS 250
+//
+// Raised from 250 ms for the same reason. A PIO desync plus recovery can take
+// longer than that, and a flashing tool with no health channel -- the Teensy
+// GUI, the OnlyKey app, anything that is not tools/halfkay_flash.py -- has no
+// way to notice the loss. Our own flasher gates on `piotimeouts` and aborts;
+// everything else depends on the proxy simply not dropping.
+//
+// Safe to raise: the wait already abandons after 20 ms if core 1 has stopped
+// ticking, so this only ever stretches for a core 1 that is alive but busy.
+#define PROXY_OUT_BLOCK_MS 1500
 
 // Anything this size or smaller is an ordinary HID report and must never block
 // the IRQ; larger means a control-pipe firmware block, which may.
@@ -1058,6 +1073,15 @@ static void bootsel_assert(void) {
 // truly powering down.
 #define PROXY_BOOTSEL_RESET_AFTER 2
 
+// Resets to try before giving up and waiting for a human.
+//
+// Counted in a watchdog scratch register, NOT in RAM: a reset clears RAM, so a
+// RAM counter can never notice that resetting is not helping, and the board
+// loops forever power-cycling the key. Giving up eventually is the lesser
+// evil -- an endless reset loop is not "unattended", it is a board thrashing
+// with the console dropping out every few seconds.
+#define PROXY_BOOTSEL_MAX_RESETS 3
+
 // Automatic recovery can be switched off ('A').
 //
 // It power-cycles the key every few seconds while the port is silent, which is
@@ -1094,6 +1118,12 @@ static void bootsel_service(void) {
   if (linked || !g_power_is_on) {
     idle_since = millis();
     attempts = 0;
+    if (linked) {
+      // Recovery worked (or was never needed): forget the escalation history,
+      // otherwise the count survives forever and the next genuine problem gets
+      // fewer attempts than it should.
+      watchdog_hw->scratch[4] = 0;
+    }
     g_seen_device = g_seen_device || linked;
     return;
   }
@@ -1149,9 +1179,27 @@ static void bootsel_service(void) {
   // machines must be torn down first. A reset does that wholesale and is known
   // good, so use it rather than a clever thing that is not.
   if (attempts > PROXY_BOOTSEL_RESET_AFTER) {
-    LOGF("[bsel] %u cold entries failed -- resetting the RP2040, which is the "
-         "only recovery that reliably brings a dead key back\r\n",
-         attempts - 1);
+    // Count resets in a scratch register, because `attempts` does NOT survive
+    // one -- and escalating to a reset that clears the counter is a reset
+    // loop. That is exactly what happened: two cold entries, reset, two more,
+    // reset, forever, power-cycling the key the whole time. A counter in RAM
+    // cannot fix this; it has to live somewhere the reset does not touch.
+    //
+    // Scratch[4] onwards is free for application use (the bootrom and SDK use
+    // the lower ones), and it is preserved across a watchdog reset.
+    uint32_t const resets = watchdog_hw->scratch[4];
+    if (resets >= PROXY_BOOTSEL_MAX_RESETS) {
+      LOGF("[bsel] %lu resets have not brought the key back -- stopping. "
+           "Unplug and replug it, or press RESET.\r\n",
+           (unsigned long)resets);
+      g_bootsel_auto = false; // stop; a human has to look at this one
+      return;
+    }
+    LOGF("[bsel] %u cold entries failed -- resetting the RP2040 (reset %lu of "
+         "%u), which is the only recovery that reliably revives a dead key\r\n",
+         attempts - 1, (unsigned long)(resets + 1),
+         (unsigned)PROXY_BOOTSEL_MAX_RESETS);
+    watchdog_hw->scratch[4] = resets + 1;
     for (uint8_t i = 0; i < 20 && !g_log_ring.empty(); i++) {
       drain_log();
       delay(5);
