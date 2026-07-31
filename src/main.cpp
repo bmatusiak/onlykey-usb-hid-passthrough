@@ -167,9 +167,17 @@ extern "C" volatile uint32_t pio_usb_tx_timeouts;
 // way to notice the loss. Our own flasher gates on `piotimeouts` and aborts;
 // everything else depends on the proxy simply not dropping.
 //
+// It must also OUTLAST the chip-erase hold-off below, and that is the binding
+// constraint. During the hold-off forward_out() deliberately drains nothing,
+// while a GUI that does not wait for the erase keeps sending at ~35 blocks/s.
+// At 1500 ms a block was dropped 1.5 s into a 3 s hold-off -- caught in the act
+// at address 0x004000. Deepening the queue cannot fix this: 3 s of that rate is
+// ~105 blocks, over 120 KB of slots. Blocking the sender is the only thing that
+// works, and it is exactly what teensy_loader_cli does with its own sleep.
+//
 // Safe to raise: the wait already abandons after 20 ms if core 1 has stopped
 // ticking, so this only ever stretches for a core 1 that is alive but busy.
-#define PROXY_OUT_BLOCK_MS 1500
+#define PROXY_OUT_BLOCK_MS 4000
 
 // Anything this size or smaller is an ordinary HID report and must never block
 // the IRQ; larger means a control-pipe firmware block, which may.
@@ -211,6 +219,13 @@ extern "C" volatile uint32_t pio_usb_tx_timeouts;
 // trigger for the PIO desync above. Enforcing the delay here makes every
 // flashing tool behave, whether or not it waits.
 #define PROXY_HALFKAY_ERASE_MS 3000
+
+// The back-pressure wait must outlast the hold-off, or reports that arrive
+// while forwarding is deliberately paused are dropped instead of waiting. That
+// is not theoretical: it lost a firmware block at 0x004000 during a GUI flash.
+static_assert(PROXY_OUT_BLOCK_MS > PROXY_HALFKAY_ERASE_MS,
+              "PROXY_OUT_BLOCK_MS must exceed PROXY_HALFKAY_ERASE_MS, or the "
+              "erase hold-off itself causes dropped reports");
 
 #define PROXY_MAX_HID 4
 static_assert(PROXY_MAX_HID <= CFG_TUD_HID,
@@ -1124,17 +1139,28 @@ static void bootsel_service(void) {
     return; // switched off with 'A' so the board can be poked at by hand
   }
 
-  // A live device, or no power, means there is nothing to recover from.
-  if (linked || !g_power_is_on) {
+  // A live device means there is nothing to recover from.
+  if (linked) {
     idle_since = millis();
     attempts = 0;
-    if (linked) {
-      // Recovery worked (or was never needed): forget the escalation history,
-      // otherwise the count survives forever and the next genuine problem gets
-      // fewer attempts than it should.
-      watchdog_hw->scratch[4] = 0;
-    }
-    g_seen_device = g_seen_device || linked;
+    // Recovery worked (or was never needed): forget the escalation history,
+    // otherwise the count survives forever and the next genuine problem gets
+    // fewer attempts than it should.
+    watchdog_hw->scratch[4] = 0;
+    g_seen_device = true;
+    return;
+  }
+
+  // No power: nothing can enumerate, so do not count the silence against the
+  // key. But do NOT clear `attempts` here.
+  //
+  // That was a self-defeating bug: a cold entry turns VBUS off as part of its
+  // own sequence, so this branch fired every time and reset the counter. The
+  // count never got past 1, the escalation to a reset could never trigger, and
+  // the board cold-entried forever -- logging "try 1" each time, which was the
+  // visible tell. A recovery must not erase the evidence of its own failures.
+  if (!g_power_is_on) {
+    idle_since = millis();
     return;
   }
 
