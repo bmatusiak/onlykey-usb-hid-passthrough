@@ -106,13 +106,17 @@ right VID/PID, console present, but `itf=0`) has nothing running, so it must be
 power-cycled first. Use **`B`**: cut VBUS 3 s → restore → let it boot 1.5 s →
 press 300 ms → **release**. `R` works too, since a reset power-cycles the key.
 
-**Cutting VBUS is not a real power cycle.** The PIO keeps driving D+/D− while
-the rail is down, back-feeding the key through its protection diodes so it never
-loses power. `R` works every time because an RP2040 reset takes *every* pad
-high-Z at once — that is the only way the key genuinely dies. This is why the
-old note that "VBUS commands don't make the key re-run its startup" was true.
-Releasing the pads deliberately is what `PROXY_CUT_DATA_LINES` tried, and it
-wedges the host stack.
+**Cutting VBUS IS a real power cycle** — measured twice: with VBUS off the key
+unmounts and sends nothing for 15 s, and on `p` it runs its LED boot sequence.
+Earlier claims that it was not (and a back-feed-through-D+/D− theory invented to
+explain them) are **disproved**. `PROXY_CUT_DATA_LINES` existed to fix that
+non-problem; treat it as vestigial.
+
+Still unexplained: on a **descriptor-less** key, `R` recovers it every time and
+`B` does not, even though both power-cycle it. The remaining difference is when
+the contact is pressed — `R` has it grounded *through* the power-up (GPIO 6
+reset pull-down) and released as the proxy boots; `B` powers up released and
+presses after. Open question, not settled.
 
 Auto-recovery does the cold entry, backs off to 2 min rather than giving up
 (stranding the rig needs a human, which defeats the point), **escalates to an

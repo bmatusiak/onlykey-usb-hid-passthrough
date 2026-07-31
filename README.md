@@ -707,29 +707,36 @@ So the working sequence, which is just what a human does, is:
 
 That is `B`. Use it, not `b`, whenever the port has gone silent.
 
-##### Why cutting VBUS is not a real power cycle
+##### Why `B` sometimes is not enough — and what is NOT the reason
 
-`B` is often not enough, and the reason matters: **the PIO keeps driving D+/D−
-while the rail is down.** Those lines back-feed the key through its protection
-diodes, so it never actually loses power and never re-runs its startup.
+**VBUS cycling does power the key down.** Observed directly: during a `p` cycle
+the OnlyKey runs its LED boot sequence, which is the key itself reporting a cold
+start. Any claim that the rail stays alive is wrong.
 
-`R` (reboot the RP2040) recovers a stuck key every single time, and this is why:
-a reset takes *every* pad high-Z at once. The data lines stop being driven, the
-key genuinely dies, and GPIO 6's reset pull-down grounds the contact as it comes
-back up. Measured on a genuinely stuck key — three automatic pulses, three manual
-`b` presses, and repeated VBUS cycles at both 750 ms and 3 s all did nothing;
-`R` recovered it immediately, every time.
+An earlier version of this section asserted the opposite — that the PIO driving
+D+/D− back-feeds the key through its protection diodes and keeps it powered.
+That was **inference, not measurement**, built to explain why `R` recovered a
+stuck key when `B` did not. It was written up as established fact and it is not
+true. A long-standing note elsewhere in this project claiming the VBUS commands
+"do not make the key re-run its startup" is wrong for the same reason.
 
-This also explains a long-standing note in this project that the VBUS commands
-"do not make the key re-run its startup". That was never mysterious. It is the
-data lines.
+So `PROXY_CUT_DATA_LINES` is **not** needed for power cycling, and the argument
+that made it look necessary does not hold.
 
-Releasing the pads deliberately during the cut would be the neat fix, and is
-what `PROXY_CUT_DATA_LINES` attempted — but it wedges the host stack, because
-the PIO state machines have to be torn down first and are not. So rather than
-build on a theory, **automatic recovery escalates to an RP2040 reset after
-`PROXY_BOOTSEL_RESET_AFTER` (2) failed cold entries**, using the mechanism that
-is measured to work rather than the one that ought to.
+What remains genuinely unexplained: on a key stuck **descriptor-less**, three
+automatic cold entries, three manual `b` presses and repeated VBUS cycles did
+nothing, while `R` recovered it immediately every time. Both power-cycle the
+key, so the difference is *when the contact is pressed relative to the key's
+power-up*, not whether power was cut:
+
+- `R` — the contact is grounded by GPIO 6's reset pull-down **during** the
+  key's power-up, and released as the proxy's firmware boots
+- `B` — the key powers up with the contact **released**, and is pressed
+  afterwards
+
+That is a live question, not a settled one. Until it is answered, automatic
+recovery escalates to an RP2040 reset after `PROXY_BOOTSEL_RESET_AFTER` (2)
+failed cold entries, because a reset is measured to work every time.
 
 The recovery also **no longer gives up** after a fixed number of tries —
 stopping left the rig permanently stranded needing a human, which is the
@@ -885,18 +892,26 @@ and reverts GPIO 6 to input-with-pull-down, so the key restarts with its contact
 grounded and lands in the bootloader. Expect to re-flash the key after every
 proxy upload.
 
-**VBUS commands are not a true power cycle.** Cutting VBUS drops the key off
-the bus, but it does not make the key re-run its startup — bootloader entry by
-holding the contact across a VBUS cycle never worked, and neither does a soft
-reboot out of HalfKay reproduce a cold boot. The mechanism is not established;
-this is an observation. Only a physical unplug/replug is known to give a genuine
-cold start.
+**VBUS commands ARE a true power cycle.** This entry previously said the
+opposite — that cutting VBUS did not make the key re-run its startup, mechanism
+unknown. That is **disproved**, by two independent measurements:
 
-`PROXY_CUT_DATA_LINES=1` releases the data pads during power-off on the theory
-that leakage through them keeps the device alive. It is **off by default and
-unproven** — it also wedges Pico-PIO-USB, because releasing the pads mid-flight
-stops the host stack servicing and the command that would restore power never
-runs. Doing it safely would need the PIO state machines stopped first.
+- With VBUS off, all four interfaces unmount and the key sends **nothing** for
+  15 s, on a device that otherwise chatters constantly. A powered device holds
+  its D+ pull-up and stays enumerated; this one drops off the bus entirely.
+- On `p`, the OnlyKey runs its **LED boot sequence** — the key itself reporting
+  a cold start.
+
+The old claim survived a long time because it was never tested; both checks
+above take under a minute. A later theory that the PIO back-feeds the key
+through D+/D− was invented to explain it and is equally unsupported.
+
+`PROXY_CUT_DATA_LINES=1` releases the data pads during power-off, on that same
+theory that leakage keeps the device alive. **The theory is dead, so the option
+has no known purpose.** It remains off by default and also wedges Pico-PIO-USB,
+because releasing the pads mid-flight stops the host stack servicing and the
+command that would restore power never runs. Treat it as vestigial rather than
+as pending work.
 
 **Core 1 stalls — both causes now addressed.**
 

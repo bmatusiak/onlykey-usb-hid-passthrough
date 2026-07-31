@@ -1093,9 +1093,19 @@ static void bootsel_assert(void) {
 #define PROXY_BOOTSEL_BACKOFF_MAX_MS 120000
 
 // Cold entries to try before escalating to a full RP2040 reset. Kept low
-// because the reset is the recovery that actually works: cutting VBUS alone
-// leaves the PIO driving D+/D-, which back-feeds the key and stops it ever
-// truly powering down.
+// because the reset is the recovery measured to work every time on a
+// descriptor-less key, while a cold entry sometimes does not.
+//
+// WHY is not established. It is NOT that VBUS cycling fails to power the key
+// down -- that was assumed and is disproved: with VBUS off the key unmounts and
+// sends nothing for 15 s, and on `p` it runs its LED boot sequence. Both
+// recoveries genuinely power-cycle it.
+//
+// The remaining difference is WHEN the contact is pressed relative to the key's
+// power-up: a reset has GPIO 6 grounded by its reset pull-down THROUGH the
+// power-up and released as this firmware boots, whereas a cold entry powers the
+// key up with the contact released and presses afterwards. Worth testing before
+// anyone tunes the timings below.
 #define PROXY_BOOTSEL_RESET_AFTER 2
 
 // Resets to try before giving up and waiting for a human.
@@ -1201,19 +1211,17 @@ static void bootsel_service(void) {
 
   // Escalate to a full RP2040 reset once the gentler recovery has had a fair
   // go. This is not a shrug -- a reset is the ONE recovery measured to work
-  // every time on a key that will not come back, and the reason appears to be
-  // that it is the only way the data lines stop being driven.
+  // every time on a key that will not come back.
   //
-  // Cutting VBUS is not enough on its own: the PIO keeps driving D+/D- while
-  // the rail is down, which back-feeds the key through its protection diodes,
-  // so it never actually loses power and never re-runs its startup. During a
-  // reset every pad goes high-Z at once, the key genuinely dies, and GPIO 6's
-  // reset pull-down grounds the contact as it comes back up.
+  // Why it beats a cold entry is NOT established, and a previous version of
+  // this comment claimed it confidently and wrongly: that cutting VBUS left the
+  // PIO back-feeding the key so it never lost power. Disproved -- with VBUS off
+  // the key unmounts and sends nothing for 15 s, and on `p` it runs its LED
+  // boot sequence. See PROXY_BOOTSEL_RESET_AFTER for what the real difference
+  // probably is (when the contact is pressed relative to the power-up).
   //
-  // Releasing the pads deliberately would be neater, but that is what
-  // PROXY_CUT_DATA_LINES tried and it wedges the host stack -- the state
-  // machines must be torn down first. A reset does that wholesale and is known
-  // good, so use it rather than a clever thing that is not.
+  // Using the reset here is therefore an empirical choice, not a reasoned one:
+  // it works every time, and that is the whole justification.
   if (attempts > PROXY_BOOTSEL_RESET_AFTER) {
     // Count resets in a scratch register, because `attempts` does NOT survive
     // one -- and escalating to a reset that clears the counter is a reset
@@ -1403,10 +1411,12 @@ static void console_service(void) {
     case 'R':
       // Reboot the RP2040 to put the attached key into ITS bootloader.
       //
-      // Fallback for a key that is not responding at all. The VBUS commands do
-      // not make the key re-run its startup (observed; mechanism unconfirmed),
-      // whereas during an RP2040 reset GPIO18 goes undriven and GPIO6 reverts
-      // to input-with-pull-down, holding the contact grounded while the key
+      // Fallback for a key that is not responding at all. The VBUS commands DO
+      // power-cycle the key (measured: it unmounts and goes silent with VBUS
+      // off, and runs its LED boot sequence on `p`) -- an earlier comment here
+      // claimed otherwise and was wrong. What a reset adds is that GPIO18 goes
+      // undriven and GPIO6 reverts to input-with-pull-down, holding the contact
+      // grounded while the key
       // restarts.
       //
       // Direct-wire only. With a transistor the same pull-down holds the gate
