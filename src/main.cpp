@@ -787,6 +787,16 @@ static void set_report_thunk(uint8_t report_id, hid_report_type_t report_type,
     // firmware can be in.
     g_out_dropped++;
     g_out_drop_flag = true; // sticky: surfaces in status and on the LED
+
+    // Say WHAT was lost, not just that something was. "drops=1" leaves it
+    // unknowable whether a firmware block went missing (corrupt image) or an
+    // incidental report did (harmless) -- and those need completely different
+    // responses. For a HalfKay block the first three bytes are the flash
+    // address, so this identifies exactly which block to distrust.
+    LOGF("[out] DROPPED itf %u id=%u type=%u len=%u : %02X %02X %02X %02X\r\n",
+         ITF, report_id, (unsigned)report_type, bufsize,
+         bufsize > 0 ? buffer[0] : 0, bufsize > 1 ? buffer[1] : 0,
+         bufsize > 2 ? buffer[2] : 0, bufsize > 3 ? buffer[3] : 0);
     return;
   }
   if (bufsize > sizeof(slot->data)) {
