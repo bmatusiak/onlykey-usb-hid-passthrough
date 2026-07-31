@@ -472,6 +472,39 @@ So the rule is split by size:
 - **<= 64 bytes** — an ordinary HID report. **Never blocks.** The queue is deep
   enough that core 1 keeps up, and a dropped keystroke is survivable.
 
+#### `PROXY_OUT_BLOCK_MS` must outlast `PROXY_HALFKAY_ERASE_MS`
+
+There is a `static_assert` on this, because getting it wrong silently corrupts
+firmware and the two constants live in different parts of the file.
+
+The erase hold-off deliberately stops `forward_out()` draining for 3 s. A
+flashing tool that does not wait for the chip erase — the Teensy Loader GUI does
+not — keeps sending at **~35 blocks/s** throughout. If the back-pressure wait is
+shorter than the hold-off, those blocks fill the queue and are then **dropped**,
+after the PC has already been ACKed.
+
+Measured, with the drop diagnostics that made it visible in one run:
+
+```
+11.319  [out] slot 0 block 0 sent, holding 3000 ms for chip erase
+12.886  [out] DROPPED itf 0 id=0 type=2 len=1088 : 00 40 00 00
+14.328  [out] slot 0 erase window over, resuming
+```
+
+A firmware block at `0x004000`, lost inside the hold-off. The hold-off was added
+to *prevent* corruption and was causing it.
+
+A deeper queue cannot fix this — 3 s at that rate is ~105 blocks, over 120 KB of
+slots. Blocking the sender is the only mechanism that works, and it is exactly
+what `teensy_loader_cli` does with its own `sleep(3)`. Across three runs of the
+same GUI flash:
+
+| Queue / wait | Drops | Firmware after reboot |
+|---|---|---|
+| 8 / 250 ms | 22 | dead |
+| 16 / 1500 ms | 1 | alive, but only because the lost report was not a block |
+| 16 / **4000 ms** | **0** | **alive** |
+
 Verified: 20 consecutive raw-HID writes all forwarded with a reply for each, and
 a full firmware flash at `PC->dev : 210 sent, 0 dropped`.
 
@@ -809,8 +842,8 @@ Top of `src/main.cpp`.
 | `PROXY_BOOTSEL_ACTIVE_HIGH` | `0` | `0` = direct wire (open-drain), `1` = via transistor. Wrong value bricks bootup — see Hardware |
 | `PROXY_BOOTSEL_AUTO` | `1` | Auto-pulse the contact when the port stays silent |
 | `PROXY_MAX_OUT_REPORT` | `1152` | Largest host→device report; sized for HalfKay's 1089 bytes |
-| `PROXY_OUT_QUEUE_LEN` | `8` | Host→device queue depth. Too shallow silently corrupts firmware writes |
-| `PROXY_OUT_BLOCK_MS` | `250` | How long a large report waits for a free slot (see *back-pressure*) |
+| `PROXY_OUT_QUEUE_LEN` | `16` | Host→device queue depth. Too shallow silently corrupts firmware writes |
+| `PROXY_OUT_BLOCK_MS` | `4000` | How long a large report waits for a slot. **Must exceed `PROXY_HALFKAY_ERASE_MS`** — see *back-pressure* |
 | `PROXY_SMALL_REPORT_MAX` | `64` | At or below this, a report never blocks the IRQ |
 | `PROXY_IN_QUEUE_LEN` | `32` | Device→PC queue depth per interface |
 | `PROXY_BOOTSEL_REBOOT_GRACE_MS` | `30000` | Silence tolerated before poking a key that has already enumerated once |

@@ -190,6 +190,11 @@ concluding a key is dead; `okprobe.py --settle` does this.
   drains it. Writing to CDC from an IRQ deadlocks the device stack.
 - **A dropped OUT report is silent corruption**, because the host was ACKed
   before we knew we could forward it. Never make a drop quieter.
+- **`PROXY_OUT_BLOCK_MS` must exceed `PROXY_HALFKAY_ERASE_MS`** (there is a
+  `static_assert`). The hold-off stops forwarding for 3 s while a GUI that does
+  not wait for the chip erase keeps sending at ~35 blocks/s — if the wait is
+  shorter, those blocks are dropped and the image is corrupt. A deeper queue
+  cannot substitute: 3 s at that rate is ~105 blocks, >120 KB.
 - **Only `arm_service()` may arm an IN endpoint**, and only when a queue slot is
   free. An unrequested report stays in the device — real USB back-pressure —
   while a received one can only be dropped. `tuh_hid_report_received_cb()` must
