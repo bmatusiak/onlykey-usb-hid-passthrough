@@ -629,11 +629,10 @@ which stalled forwarding after a few hundred reports. `tuh_hid_receive_ready()`
 is false while a request is pending, so this only re-issues once the previous
 report has actually arrived.
 
-**The `rearm` counter is not a fault signal.** It once was, back when the report
-callback did the re-arming and `arm_service()` only stepped in after a broken
-chain. Now that `arm_service()` is the sole armer it increments on every normal
-re-arm, so it tracks `in` almost exactly — 2502 in / 2502 rearm on a keyboard
-during a backup is healthy, not alarming. `indrops` is the signal to watch.
+**The `rearm` counter is not a fault signal.** `arm_service()` is the sole armer,
+so it increments on every normal re-arm and tracks `in` almost exactly —
+2502 in / 2502 rearm on a keyboard during a backup is healthy, not alarming.
+`indrops` is the signal to watch.
 
 **Only `arm_service()` may arm an interface**, and it refuses unless a queue
 slot is free:
@@ -707,38 +706,24 @@ So the working sequence, which is just what a human does, is:
 
 That is `B`. Use it, not `b`, whenever the port has gone silent.
 
-##### Why `B` sometimes is not enough — and what is NOT the reason
+##### Why `B` sometimes is not enough
 
-**VBUS cycling does power the key down.** Observed directly: during a `p` cycle
-the OnlyKey runs its LED boot sequence, which is the key itself reporting a cold
-start. Any claim that the rail stays alive is wrong.
+On a key stuck **descriptor-less**, three automatic cold entries, three manual
+`b` presses and repeated VBUS cycles all did nothing, while `R` recovered it
+immediately, every time. There is **no working theory** for why. Automatic
+recovery therefore escalates to an RP2040 reset after
+`PROXY_BOOTSEL_RESET_AFTER` (2) failed cold entries — a reset is measured to
+work every time, and that is the whole justification.
 
-An earlier version of this section asserted the opposite — that the PIO driving
-D+/D− back-feeds the key through its protection diodes and keeps it powered.
-That was **inference, not measurement**, built to explain why `R` recovered a
-stuck key when `B` did not. It was written up as established fact and it is not
-true. A long-standing note elsewhere in this project claiming the VBUS commands
-"do not make the key re-run its startup" is wrong for the same reason.
+These are ruled out, each by direct measurement:
 
-So `PROXY_CUT_DATA_LINES` is **not** needed for power cycling, and the argument
-that made it look necessary does not hold.
+| Not the reason | Evidence |
+|---|---|
+| VBUS cycling does not really cut power | With VBUS off the key unmounts and sends nothing for 15 s; on `p` it runs its LED boot sequence |
+| The PIO back-feeds the key through D+/D− | The proxy keeps running during a VBUS-off, so the data lines *are* still driven — and the key dies anyway |
+| GPIO 6's reset pull-down enters the bootloader | In RP2040 BOOTSEL every pad sits at reset state for the key's whole power-up, and it returns in **application** mode |
 
-**GPIO 6's reset pull-down does not trigger the bootloader either.** During
-`coldcycle.py` the RP2040 sits in its ROM bootloader with every pad at reset
-state, so the contact is grounded through the key's *entire* power-up — and the
-key came back in **application** mode. So "contact grounded across power-up
-enters the bootloader" is out as well.
-
-What remains genuinely unexplained: on a key stuck **descriptor-less**, three
-automatic cold entries, three manual `b` presses and repeated VBUS cycles did
-nothing, while `R` recovered it immediately every time. Both power-cycle the
-key. Neither the data lines nor pull-down timing explains the difference —
-every mechanism proposed so far has been tested and eliminated.
-
-The honest state of this is **no working theory**. Until there is one, automatic
-recovery escalates to an RP2040 reset after `PROXY_BOOTSEL_RESET_AFTER` (2)
-failed cold entries, purely because a reset is measured to work every time and
-not because anyone knows why.
+Consequently `PROXY_CUT_DATA_LINES` serves no known purpose.
 
 The recovery also **no longer gives up** after a fixed number of tries —
 stopping left the rig permanently stranded needing a human, which is the
@@ -885,9 +870,8 @@ Top of `src/main.cpp`.
 must re-flash; there is no booting back out. `halfkay_flash.py --boot-only`
 returns the key to *HalfKay*, not to the application, because HalfKay has nothing
 valid to jump to. This is correct Teensy behaviour, but it looks exactly like a
-passthrough failure and has been misread as one more than once — including as
-apparent evidence against a fix that was working correctly. Any procedure that
-enters the bootloader must flash to get back.
+passthrough failure — do not read it as one. Any procedure that enters the
+bootloader must flash to get back.
 
 Flashing or resetting the **Feather** power-cycles the key, so where it lands
 depends entirely on whether its firmware is valid:
@@ -896,14 +880,9 @@ depends entirely on whether its firmware is valid:
 - **invalidated** (an earlier bootloader entry) → **bootloader**, because there
   is nowhere else to go
 
-Both observed with the same tool minutes apart. An earlier version of this note
-claimed a Feather reset *always* leaves the key in the bootloader, blaming
-GPIO 6's reset pull-down for grounding the contact through the power-up. That
-was a guess; firmware validity explains every observation without it.
+Both observed with the same tool minutes apart.
 
-**VBUS commands ARE a true power cycle.** This entry previously said the
-opposite — that cutting VBUS did not make the key re-run its startup, mechanism
-unknown. That is **disproved**, by two independent measurements:
+**VBUS commands are a true power cycle.** Two independent measurements:
 
 - With VBUS off, all four interfaces unmount and the key sends **nothing** for
   15 s, on a device that otherwise chatters constantly. A powered device holds
@@ -911,21 +890,16 @@ unknown. That is **disproved**, by two independent measurements:
 - On `p`, the OnlyKey runs its **LED boot sequence** — the key itself reporting
   a cold start.
 
-The first of those also **disproves the D+/D− back-feed theory directly**, not
-merely by inference: the proxy is still running throughout a `0`, so the PIO is
-still driving the data lines. VBUS off, data lines driven, key dead. That is the
-exact condition under which back-feed would have to show itself, and it does
-not.
+The first also rules out the data lines keeping the key alive: the proxy is
+still running throughout a `0`, so the PIO *is* still driving D+/D−. VBUS off,
+data lines driven, key dead.
 
-Both checks take under a minute. The old claim survived a long time only because
-nobody ran them.
-
-`PROXY_CUT_DATA_LINES=1` releases the data pads during power-off, on that same
-theory that leakage keeps the device alive. **The theory is dead, so the option
-has no known purpose.** It remains off by default and also wedges Pico-PIO-USB,
-because releasing the pads mid-flight stops the host stack servicing and the
-command that would restore power never runs. Treat it as vestigial rather than
-as pending work.
+`PROXY_CUT_DATA_LINES=1` releases the data pads during power-off, to stop
+leakage through them keeping the device alive. **The measurements above show
+there is no such leakage, so the option serves no known purpose.** It is off by
+default and wedges Pico-PIO-USB when enabled, because releasing the pads
+mid-flight stops the host stack servicing and the command that would restore
+power never runs. Vestigial, not pending work.
 
 **Core 1 stalls — both causes now addressed.**
 
