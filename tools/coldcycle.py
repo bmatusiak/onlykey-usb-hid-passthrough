@@ -9,8 +9,8 @@ routing through the RP2040's own ROM bootloader:
      it disappears from the bus entirely, 0 devices enumerated
   3. wait as long as you like; unlike a watchdog reset this is not a few
      milliseconds of undriven pads
-  4. copy the already-built UF2 -> the RP2040 leaves BOOTSEL and runs the proxy
-     again, VBUS returns, and the key boots from genuinely dead
+  4. picotool loads the already-built UF2 -> the RP2040 leaves BOOTSEL and runs
+     the proxy again, VBUS returns, and the key boots from genuinely dead
 
 Why this matters: cutting VBUS from firmware is NOT a power cycle. The PIO keeps
 driving D+/D- while the rail is down and back-feeds the key through its
@@ -28,16 +28,19 @@ Both observed minutes apart. If you want the bootloader from a working key, use
     python coldcycle.py              cycle, then report where the key landed
     python coldcycle.py --hold 8     hold the key unpowered for 8 s
 
-`picotool reboot -a` would be the tidier way out of BOOTSEL, but on Windows it
-needs a WinUSB driver installed via Zadig, which displaces the RPI-RP2 drive the
-flashing path depends on. Copying the UF2 needs no setup and is the same
-operation `pio run -t upload` already performs.
+BOOTSEL is detected by the RP2040's ROM bootloader appearing on the USB bus as
+2E8A:0003, not by waiting for the RPI-RP2 drive to mount. Nothing here needs the
+drive mounted, which matters because this rig does not automount it -- and the
+device being on the bus is the more direct evidence anyway.
+
+Leaving BOOTSEL uses picotool, which on Linux talks to the ROM bootloader
+through libusb and needs only a udev rule for 2E8A -- no driver install and no
+mount. It is the same operation `pio run -t upload` performs.
 
 Exit 0 if the key came back, 1 otherwise.
 """
 import argparse
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -50,16 +53,21 @@ UF2 = os.path.join(ROOT, ".pio", "build",
                    "adafruit_feather_rp2040_usb_host", "firmware.uf2")
 
 
-def bootsel_drive():
-    """Return the RPI-RP2 drive letter, or None."""
-    result = subprocess.run(
-        ["powershell", "-NoProfile", "-Command",
-         "Get-CimInstance Win32_LogicalDisk | "
-         "Where-Object { $_.VolumeName -eq 'RPI-RP2' } | "
-         "Select-Object -ExpandProperty DeviceID"],
-        capture_output=True, text=True)
-    drive = result.stdout.strip()
-    return drive or None
+def leave_bootsel(uf2):
+    """Load the UF2 and run it. Returns None on success, else a message."""
+    tool = rig.picotool()
+    if not tool:
+        return ("no picotool found -- install it, or build once with PlatformIO "
+                "so the core's copy is unpacked")
+    result = subprocess.run([tool, "load", "-x", uf2],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        # Almost always the 2E8A udev rule: without it the ROM bootloader is
+        # readable but not claimable, and picotool fails on open, not on find.
+        return ("picotool failed (%d): %s"
+                % (result.returncode,
+                   (result.stderr or result.stdout).strip()))
+    return None
 
 
 def main():
@@ -82,15 +90,10 @@ def main():
     subprocess.run([sys.executable, os.path.join(HERE, "touch1200.py"), port],
                    capture_output=True, text=True)
 
-    drive = None
-    deadline = time.time() + 15
-    while time.time() < deadline and not drive:
-        time.sleep(0.5)
-        drive = bootsel_drive()
-    if not drive:
+    if not rig.wait_for_bootsel(timeout=15):
         print("the Feather never reached BOOTSEL")
         return 1
-    print("BOOTSEL on %s -- the key is now unpowered" % drive)
+    print("BOOTSEL (%s) -- the key is now unpowered" % rig.BOOTSEL_IDS)
 
     # Proof, not assumption: nothing of the key should be on the bus at all.
     remaining = len(rig.usb_nodes(rig.APP_IDS)) + len(rig.usb_nodes(rig.BOOT_IDS))
@@ -100,13 +103,22 @@ def main():
     print("holding %.1f s" % args.hold)
     time.sleep(args.hold)
 
-    shutil.copyfile(args.uf2, os.path.join(drive + "\\", "firmware.uf2"))
-    print("UF2 copied; the proxy is restarting")
+    problem = leave_bootsel(args.uf2)
+    if problem:
+        print(problem)
+        return 1
+    print("UF2 loaded; the proxy is restarting")
 
-    # The key powers up with the contact pressed (GPIO 6 reset pull-down) and
-    # released as the proxy boots, so it should land in its bootloader.
-    port = rig.wait_for_mode(rig.BOOT_IDS, timeout=45) or \
-        rig.wait_for_mode(rig.APP_IDS, timeout=15)
+    # Where it lands is decided by the key's firmware, not by this tool: valid
+    # firmware cold-boots into the application, an invalidated image has nowhere
+    # to go but the bootloader. GPIO 6's reset pull-down does NOT force the
+    # bootloader -- in BOOTSEL every pad sits at reset state through the key's
+    # whole power-up and it still comes back in application mode, measured here
+    # and again on Linux.
+    #
+    # So wait for EITHER rather than guessing an order. Waiting on the
+    # bootloader first cost a 45 s timeout on the ordinary path, every time.
+    port = rig.wait_for_mode(None, timeout=60)
     if not port:
         print("the key did not come back")
         return 1

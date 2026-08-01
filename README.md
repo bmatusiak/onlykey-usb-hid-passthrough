@@ -287,7 +287,7 @@ always sends block 0 to trigger the chip erase and waits 3 s after it, skips
 blank blocks, and finishes with the `FF FF FF` reboot packet.
 
 **It fails fast.** Flashing through the proxy means a successful
-`HidD_SetOutputReport` proves nothing: the proxy ACKs the control transfer before
+write proves nothing: the proxy ACKs the control transfer before
 it knows whether it can forward the report, so a wedged host core makes every
 write "succeed" while the key receives nothing. The flasher therefore watches the
 proxy's own `s` health line over the console — auto-detected as the CDC sharing
@@ -316,7 +316,7 @@ procedure needs someone to press something, that is a gap to close.
 | [`okprobe.py`](tools/okprobe.py) | Ask the key a real question and check it answers |
 | [`console.py`](tools/console.py) | The one sanctioned way to hold the console |
 | [`touch1200.py`](tools/touch1200.py) | Put the **Feather** into BOOTSEL — no button press |
-| [`rig.py`](tools/rig.py) / [`winhid.py`](tools/winhid.py) | Shared console and HID plumbing |
+| [`rig.py`](tools/rig.py) / [`linuxhid.py`](tools/linuxhid.py) | Shared console and HID plumbing |
 
 Two rules the helpers exist to enforce. **Only one process may hold the console**
 — a second opener gets `PermissionError(13)` and the capture is lost, which cost
@@ -324,8 +324,8 @@ two runs. And **the console's COM number moves** when the key changes mode, sinc
 the proxy adopts its VID/PID and re-enumerates, so it is always looked up, never
 cached.
 
-`winhid.py` reads with overlapped I/O and a real timeout. A blocking `ReadFile`
-on a device that never sends anything waits forever, and a harness that can hang
+`linuxhid.py` reads through `select` with a real timeout. A blocking read on a
+device that never sends anything waits forever, and a harness that can hang
 defeats the point of the exercise.
 
 ---

@@ -21,15 +21,20 @@ import sys
 import time
 
 import serial
-from serial.tools import list_ports
+
+import rig
 
 # The proxy clones the key, so its console carries the key's IDs.
 KNOWN = ("1D50:60FC", "16C0:0478")
 
 
 def find_port():
-    """Return the proxy console, preferring a port whose IDs we recognise."""
-    ports = list(list_ports.comports())
+    """Return the proxy console, preferring a port whose IDs we recognise.
+
+    Enumeration goes through rig.comports(), which survives a device vanishing
+    mid-scan -- pyserial's Linux backend raises TypeError when that happens.
+    """
+    ports = rig.comports()
     for port in ports:
         hwid = (port.hwid or "").upper()
         if any(("VID:PID=" + known) in hwid for known in KNOWN):

@@ -19,13 +19,42 @@ import time
 import serial
 from serial.tools import list_ports
 
-APP_IDS = "1D50:60FC"   # OnlyKey application firmware
-BOOT_IDS = "16C0:0478"  # Teensy HalfKay bootloader
+APP_IDS = "1D50:60FC"     # OnlyKey application firmware
+BOOT_IDS = "16C0:0478"    # Teensy HalfKay bootloader
+BOOTSEL_IDS = "2E8A:0003"  # the RP2040's own ROM bootloader (the Feather, not
+                           # the key) -- a third identity the rig passes
+                           # through, and the one a USB filter is most likely
+                           # to be missing.
 
 # Descriptors we expect to clone in application mode, in interface order. The
 # order matters: host software locates raw HID by interface number, so rawhid
 # must land at MI_02 exactly as it does on a real OnlyKey.
 EXPECTED_INTERFACES = ["keyboard", "fido2", "rawhid", "seremu"]
+
+
+def comports():
+    """list_ports.comports(), retried through a device disappearing mid-scan.
+
+    pyserial's Linux backend reads idVendor/idProduct out of sysfs and calls
+    int(read_line(...), 16) without checking the None that read_line returns
+    when the file has already gone. So a device unplugging DURING a scan raises
+    TypeError from inside comports() instead of simply not being listed:
+
+        TypeError: int() can't convert non-string with explicit base
+
+    The calls most likely to hit it are precisely the ones that exist to watch
+    for a device disappearing -- wait_for_gone() polls this every 0.2 s while a
+    watchdog reset takes the board away, and hit it reliably. Windows never saw
+    this because that backend uses SetupAPI, not sysfs.
+
+    Retrying is enough: the node is gone by the next pass.
+    """
+    for _ in range(5):
+        try:
+            return list(list_ports.comports())
+        except (TypeError, OSError):
+            time.sleep(0.1)
+    return []
 
 
 def find_console(want=None):
@@ -34,7 +63,7 @@ def find_console(want=None):
     `want` restricts the search to a VID:PID, which is how a caller waits for a
     specific mode rather than just any console.
     """
-    for port in list_ports.comports():
+    for port in comports():
         hwid = (port.hwid or "").upper()
         if want:
             if ("VID:PID=" + want) in hwid:
@@ -61,7 +90,7 @@ def wait_for_gone(port, timeout=15):
     """Wait for a port to disappear, e.g. after triggering a mode change."""
     end = time.time() + timeout
     while time.time() < end:
-        if port not in [p.device for p in list_ports.comports()]:
+        if port not in [p.device for p in comports()]:
             return True
         time.sleep(0.2)
     return False
@@ -259,17 +288,100 @@ def ensure_application(hexfile, timeout=120):
 
 
 def usb_nodes(ids):
-    """Windows device-manager nodes for a VID:PID, as a list of DeviceIDs.
+    """Kernel-bound USB interfaces for a VID:PID, one string per interface.
 
     Used to check what the PC actually bound, which is the only real proof the
-    clone is correct -- our own counters cannot show that.
+    clone is correct -- our own counters cannot show that. Reading sysfs rather
+    than lsusb keeps this dependency-free and, more usefully, reports the DRIVER
+    that claimed each interface: an interface the kernel enumerated but bound
+    nothing to is a different failure from one that never appeared.
+
+    Each entry looks like "1-1:1.2 MI_02 driver=usbhid hidraw2".
     """
-    import subprocess
-    vid, pid = ids.split(":")
-    query = (
-        "Get-CimInstance Win32_PnPEntity | "
-        "Where-Object { $_.DeviceID -match 'VID_%s&PID_%s' } | "
-        "Select-Object -ExpandProperty DeviceID" % (vid, pid))
-    result = subprocess.run(["powershell", "-NoProfile", "-Command", query],
-                            capture_output=True, text=True)
-    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    import os
+
+    vid, pid = (int(part, 16) for part in ids.split(":"))
+    root = "/sys/bus/usb/devices"
+    nodes = []
+
+    def read(*parts):
+        try:
+            with open(os.path.join(*parts)) as fh:
+                return fh.read().strip()
+        except OSError:
+            return None
+
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError:
+        return nodes
+
+    for entry in entries:
+        # Interfaces are named "1-1:1.0" and appear under their parent device;
+        # skip them here so each is reported exactly once.
+        if ":" in entry:
+            continue
+        path = os.path.join(root, entry)
+        have_vid = read(path, "idVendor")
+        have_pid = read(path, "idProduct")
+        if not have_vid or not have_pid:
+            continue
+        if int(have_vid, 16) != vid or int(have_pid, 16) != pid:
+            continue
+
+        for sub in sorted(os.listdir(path)):
+            if not sub.startswith(entry + ":"):
+                continue
+            ipath = os.path.join(path, sub)
+            number = read(ipath, "bInterfaceNumber")
+            try:
+                driver = os.path.basename(os.readlink(os.path.join(ipath, "driver")))
+            except OSError:
+                driver = "none"
+            # The hidraw node hangs below the interface via the hid device, so
+            # its depth varies; walk rather than guess the path.
+            hidraws = []
+            for parent, _, _ in os.walk(ipath):
+                if os.path.basename(parent) == "hidraw":
+                    hidraws.extend(sorted(os.listdir(parent)))
+            nodes.append("%s MI_%02d driver=%s%s"
+                         % (sub, int(number, 16) if number else -1, driver,
+                            (" " + " ".join(hidraws)) if hidraws else ""))
+    return nodes
+
+
+def in_bootsel():
+    """True if the Feather is sitting in the RP2040 ROM bootloader.
+
+    Presence on the USB bus, not a mounted RPI-RP2 drive: this rig does not
+    automount, and picotool does not need the drive anyway. It is also the more
+    direct evidence -- the drive appearing is a consequence of the device being
+    there, and it can lag by seconds.
+    """
+    return bool(usb_nodes(BOOTSEL_IDS))
+
+
+def wait_for_bootsel(timeout=15):
+    """Wait for BOOTSEL. Returns True if it arrived."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if in_bootsel():
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def picotool():
+    """Path to picotool, or None.
+
+    The earlephilhower core ships one, which is preferred over anything on PATH
+    so the version always matches the toolchain that produced the UF2.
+    """
+    import os
+
+    bundled = os.path.expanduser(
+        "~/.platformio/packages/tool-picotool-rp2040-earlephilhower/picotool")
+    if os.path.isfile(bundled) and os.access(bundled, os.X_OK):
+        return bundled
+    from shutil import which
+    return which("picotool")

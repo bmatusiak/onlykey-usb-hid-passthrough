@@ -17,7 +17,7 @@ import argparse
 import sys
 import time
 
-import winhid
+import linuxhid
 
 VID, PID = 0x1D50, 0x60FC
 
@@ -38,8 +38,11 @@ def printable(reports):
     """Pull readable text out of raw input reports."""
     text = []
     for report in reports:
-        # Byte 0 is the report ID; the key pads with NULs and 0xFF.
-        chars = [chr(b) for b in report[1:]
+        # The whole report is payload: the OnlyKey declares no report IDs, and
+        # a hidraw read does not prepend one (the Windows path did, which is why
+        # this used to skip byte 0 -- skipping here would eat a data byte). The
+        # key pads with NULs and 0xFF.
+        chars = [chr(b) for b in report
                  if 32 <= b < 127]
         chunk = "".join(chars).strip()
         if chunk:
@@ -77,7 +80,7 @@ def main():
     device = None
     deadline = time.time() + args.settle
     while time.time() < deadline:
-        device = winhid.open_interface(VID, PID, mi=RAWHID_MI)
+        device = linuxhid.open_interface(VID, PID, mi=RAWHID_MI)
         if device:
             break
         time.sleep(0.5)

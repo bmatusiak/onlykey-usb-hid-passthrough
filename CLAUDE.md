@@ -24,51 +24,73 @@ that is a bug in the procedure, not a request to make.
 
 ## This machine
 
-There is **no system Python** (`python` hits a Store stub, exit 49) and **`pio`
-is not on PATH**. Use the PlatformIO venv:
+A Linux box (ZOTAC ZBOX-MI531, bare metal). System `python3` has pyserial;
+everything else the tools need is stdlib. **`pio` is not on PATH** — it lives in
+the PlatformIO venv:
 
-```powershell
-$PY  = "C:\Users\bmatu\.platformio\penv\Scripts\python.exe"      # has pyserial
-$PIO = "C:\Users\bmatu\.platformio\penv\Scripts\platformio.exe"
+```bash
+PIO=~/.platformio/penv/bin/platformio
 ```
+
+**Permissions come from udev, not group membership.** You do not need to be in
+`dialout`; the OnlyKey and Teensy rules set the nodes `0666`, and the OnlyKey
+rule's `SUBSYSTEMS=="usb"` line propagates to the hidraw children. The one rule
+nothing else installs is `2E8A` (RP2040 BOOTSEL), kept in this repo at
+`tools/60-rp2040-bootsel.rules`. Without it `picotool` finds the board and then
+fails to claim it — which reads like the board never reached BOOTSEL rather than
+like a permission problem.
+
+**Ultimately this has to work passed through to a VirtualBox VM on a Windows
+host** — the device operation, not the build. Untried so far. The known trap:
+VirtualBox USB filters match on VID/PID, and this rig deliberately presents
+three of them (`1D50:60FC`, `16C0:0478`, `2E8A:0003`), so one filter is never
+enough.
 
 ## Build
 
-```powershell
-& $PIO run                                          # all three environments
-& $PIO run -e adafruit_feather_rp2040_usb_host      # the real one
+```bash
+$PIO run                                          # all three environments
+$PIO run -e adafruit_feather_rp2040_usb_host      # the real one
 ```
 
-`diag` and `diag_trace` are diagnostic builds. All three must compile.
+`diag` and `diag_trace` are diagnostic builds. All three must compile; a full
+build takes about 9 s.
 
 ## Flash the Feather — no hands required
 
-```powershell
-& $PY tools\touch1200.py COM14        # 1200-baud DTR touch -> RPI-RP2 on D:
-& $PIO run -e adafruit_feather_rp2040_usb_host -t upload
+```bash
+python3 tools/touch1200.py /dev/ttyACM0    # 1200-baud DTR touch -> BOOTSEL
+$PIO run -e adafruit_feather_rp2040_usb_host -t upload
 ```
 
 `Adafruit_USBD_CDC`'s `tud_cdc_line_state_cb()` enters DFU when DTR drops at
-1200 bps, so this replaces double-tapping reset. `upload_command` copies the
-UF2 to `D:\`. The console command `U` does the same thing from the other side.
+1200 bps, so this replaces double-tapping reset. `upload_command` runs
+`picotool load -x`, which loads the UF2 and runs it. The console command `U`
+does the same thing from the other side.
+
+**Nothing needs the `RPI-RP2` drive mounted**, and this rig does not automount
+it. BOOTSEL is detected by `2E8A:0003` appearing on the USB bus
+(`rig.in_bootsel()`), which is more direct than waiting for a drive that can lag
+by seconds or never arrive.
 
 ## Talk to the proxy
 
-```powershell
-& $PY tools\console.py                  # auto-detect, print the health line
-& $PY tools\console.py --keys i         # status
-& $PY tools\console.py --keys b         # put the KEY into its bootloader
-& $PY tools\console.py --watch 60       # log for 60 s
+```bash
+python3 tools/console.py                  # auto-detect, print the health line
+python3 tools/console.py --keys i         # status
+python3 tools/console.py --keys b         # put the KEY into its bootloader
+python3 tools/console.py --watch 60       # log for 60 s
 ```
 
-The console is the Feather's CDC. **Its COM number changes** when the key
-switches mode, because the proxy adopts the key's VID/PID and re-enumerates —
-roughly COM14 in application mode (`1D50:60FC`), COM15 in bootloader mode
-(`16C0:0478`). `console.py` auto-detects for that reason; never hardcode.
+The console is the Feather's CDC. **Its device node can move** between
+`/dev/ttyACM0` and `/dev/ttyACM1` when the key switches mode, because the proxy
+adopts the key's VID/PID and re-enumerates — `1D50:60FC` in application mode,
+`16C0:0478` in bootloader mode. `console.py` auto-detects for that reason; never
+hardcode.
 
-**Only one process may hold the port.** A second opener gets `PermissionError
-(13)` and the capture is lost. Do not leave `--watch` running during a flash —
-`halfkay_flash.py` opens the console itself for health checks.
+**Only one process may hold the port.** A second opener loses the capture. Do
+not leave `--watch` running during a flash — `halfkay_flash.py` opens the
+console itself for health checks.
 
 Key commands: `i` status · `s` health line · `z` zero counters · `b` put the
 **key** into its bootloader · `p`/`0`/`1` power · `v` verbose OUT · `U` Feather
@@ -94,8 +116,8 @@ NOT block a new flash (the flasher zeroes counters at start); only a drop
 
 ## Flash the OnlyKey through the proxy
 
-```powershell
-& $PY tools\halfkay_flash.py firmware.hex     # finds the console, fails fast
+```bash
+python3 tools/halfkay_flash.py firmware.hex   # finds the console, fails fast
 ```
 
 It auto-detects the proxy console (the CDC sharing the key's VID/PID — a real
@@ -106,6 +128,46 @@ failure. Exit `0` success, `1` flash error, `2` proxy fault (data was lost).
 ---
 
 ## Quirks that will waste your time
+
+**A hidraw write carries a leading report-ID byte; a hidraw read does not.**
+None of the OnlyKey's four descriptors declare a report ID, so a 64-byte report
+is a 65-byte write with a `0x00` in front — but the reply arrives as a bare 64
+bytes. The Windows path prefixed reads too, so code ported from it that skips
+`report[0]` silently eats a data byte. `linuxhid.write()` adds the byte;
+`read()` returns exactly what the kernel gave.
+
+**You do not get to choose whether an output report goes out on the interrupt
+endpoint or the control pipe.** The kernel picks: interrupt OUT when the
+interface has such an endpoint, control-pipe SET_REPORT when it does not. Both
+are handled by `set_report_thunk()`, which sees `report_type=INVALID` for the
+first and `OUTPUT` for the second — but only the control path takes the
+`PROXY_OUT_BLOCK_MS` hold-off, so it matters which one a change lands on.
+`python3 tools/linuxhid.py` prints the path per interface.
+
+**HalfKay has exactly one endpoint: `ep_81`, interrupt IN, 64 bytes.** Measured.
+With no OUT endpoint, a 1088-byte firmware block can only be a control-pipe
+SET_REPORT, so the flasher gets the right path without asking for it. That is
+also why `halfkay_flash.py` warns if the interface ever turns out to have an OUT
+endpoint: it would mean blocks are travelling a path the hold-off does not
+protect.
+
+**Quote `!` in an interactive bash shell.** `--keys !1` is history expansion and
+will not reach the tool; `--keys '!1'` will.
+
+**`list_ports.comports()` raises when a device unplugs mid-scan.** pyserial's
+Linux backend reads `idVendor`/`idProduct` from sysfs and calls
+`int(read_line(...), 16)` without checking the `None` that `read_line` returns
+for a file that has already gone, so the scan dies with
+
+    TypeError: int() can't convert non-string with explicit base
+
+rather than just not listing the device. The code most exposed to this is the
+code whose entire job is watching for a disappearance: `wait_for_gone()` polls
+every 0.2 s while a watchdog reset takes the board away, and hit it on the first
+Linux run of `watchdog_recovers_from_wedge` — the watchdog had fired correctly
+and recovered; only the observation crashed. Always enumerate through
+`rig.comports()`, which retries. Windows never saw this: that backend uses
+SetupAPI, not sysfs.
 
 **The bootloader triggers on RELEASE of the contact, not while it is held.** It
 is a button press: ground briefly, then let go. Holding it down *prevents* the
@@ -224,12 +286,12 @@ concluding a key is dead; `okprobe.py --settle` does this.
 
 ## Verifying a change
 
-```powershell
-& $PY tools\selftest.py            # 12 scenarios, fail-fast
-& $PY tools\selftest.py --list     # what they are
-& $PY tools\selftest.py -k flash   # just the flashing ones
-& $PY tools\soak.py 25             # stability: 25 bootloader<->app cycles
-& $PY tools\okprobe.py --count 20  # raw-HID round trips only
+```bash
+python3 tools/selftest.py            # 19 scenarios, fail-fast
+python3 tools/selftest.py --list     # what they are
+python3 tools/selftest.py -k flash   # just the flashing ones
+python3 tools/soak.py 25             # stability: 25 bootloader<->app cycles
+python3 tools/okprobe.py --count 20  # raw-HID round trips only
 ```
 
 `selftest.py` stops at the first failure and prints the `i` block, because the

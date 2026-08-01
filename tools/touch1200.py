@@ -5,10 +5,11 @@ DTR drops while the line coding is 1200 bps. Opening the console at 1200 and
 dropping DTR is therefore the same thing as double-tapping the reset button,
 except it can be scripted -- which the whole point of this rig requires.
 
-The RPI-RP2 drive appears on D: a few seconds later; that is where
-platformio.ini's upload_command copies the UF2.
+The board reappears as 2E8A:0003 a moment later; that is what
+platformio.ini's upload_command hands the UF2 to via picotool. Nothing needs the
+RPI-RP2 drive mounted.
 
-    python touch1200.py COM14
+    python3 touch1200.py /dev/ttyACM0
     pio run -e adafruit_feather_rp2040_usb_host -t upload
 
 Not to be confused with putting the *OnlyKey* into ITS bootloader, which is the
@@ -42,7 +43,7 @@ def main():
         return 2
     port = sys.argv[1]
     touch(port)
-    print("1200-baud touch sent to %s -- expect RPI-RP2 on D: shortly" % port)
+    print("1200-baud touch sent to %s -- expect 2E8A:0003 shortly" % port)
     return 0
 
 

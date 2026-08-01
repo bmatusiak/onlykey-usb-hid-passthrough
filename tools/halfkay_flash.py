@@ -1,13 +1,17 @@
-"""Flash a Teensy HalfKay bootloader over raw HID, on Windows, with no toolchain.
+"""Flash a Teensy HalfKay bootloader over raw HID, with no toolchain.
 
 A Python port of the parts of teensy_loader_cli we need. It exists because
-teensy_loader_cli has to be compiled and there is no native compiler on this
-machine -- and because having the flasher scriptable makes it possible to
-exercise the USB proxy repeatedly and instrument what it does.
+teensy_loader_cli has to be compiled, and because having the flasher scriptable
+makes it possible to exercise the USB proxy repeatedly and instrument what it
+does.
 
-Writes go out through HidD_SetOutputReport, i.e. a control-pipe SET_REPORT,
-which is the same path the proxy forwards. For a Teensy 3.2 each block is a
-1089-byte report (1 report-ID byte + 3 address bytes + 61 pad + 1024 data).
+Writes go out through Linux hidraw. For a Teensy 3.2 each block is a 1089-byte
+write (1 report-ID byte + 3 address bytes + 61 pad + 1024 data). A block that
+size can only travel the control pipe as a SET_REPORT -- no interrupt endpoint
+carries 1 KB -- and HalfKay has no OUT endpoint anyway, so the kernel takes that
+path by itself. That is the same path the proxy forwards and the only one that
+takes its PROXY_OUT_BLOCK_MS hold-off, so the tool checks it and refuses to run
+if the interface ever turns out to have an interrupt OUT endpoint.
 
     python halfkay_flash.py firmware.hex              # program then reboot
     python halfkay_flash.py --boot-only               # just reboot the key
@@ -19,8 +23,8 @@ and --block-size for other parts.
 
 Fail-fast
 ---------
-When flashing THROUGH the Feather proxy, a successful HidD_SetOutputReport
-proves nothing. The proxy ACKs the control transfer before it knows whether the
+When flashing THROUGH the Feather proxy, a successful write proves nothing. The
+proxy ACKs the control transfer before it knows whether the
 report can be forwarded, so if its host core has wedged, every write "succeeds"
 and the key receives nothing. That is not hypothetical -- it is how a run
 reported 210 blocks and IMG_REBOOT_OK while writing a corrupt image.
@@ -34,146 +38,42 @@ Exit codes: 0 success, 1 flash error, 2 proxy fault (data was lost).
 """
 
 import argparse
-import ctypes
 import sys
 import time
-from ctypes import wintypes
 
-# ---------------------------------------------------------------- Win32 ----
+import linuxhid
 
-hid = ctypes.WinDLL("hid")
-setupapi = ctypes.WinDLL("setupapi")
-kernel32 = ctypes.WinDLL("kernel32")
-
-GENERIC_READ = 0x80000000
-GENERIC_WRITE = 0x40000000
-FILE_SHARE_READ = 1
-FILE_SHARE_WRITE = 2
-OPEN_EXISTING = 3
-INVALID_HANDLE = ctypes.c_void_p(-1).value
-
-DIGCF_PRESENT = 0x02
-DIGCF_DEVICEINTERFACE = 0x10
-
-
-class GUID(ctypes.Structure):
-    _fields_ = [("d1", wintypes.DWORD), ("d2", wintypes.WORD),
-                ("d3", wintypes.WORD), ("d4", ctypes.c_ubyte * 8)]
-
-
-class SP_DEVICE_INTERFACE_DATA(ctypes.Structure):
-    _fields_ = [("cbSize", wintypes.DWORD), ("InterfaceClassGuid", GUID),
-                ("Flags", wintypes.DWORD), ("Reserved", ctypes.POINTER(ctypes.c_ulong))]
-
-
-class HIDD_ATTRIBUTES(ctypes.Structure):
-    _fields_ = [("Size", wintypes.ULONG), ("VendorID", wintypes.USHORT),
-                ("ProductID", wintypes.USHORT), ("VersionNumber", wintypes.USHORT)]
-
-
-class HIDP_CAPS(ctypes.Structure):
-    _fields_ = [
-        ("Usage", wintypes.USHORT), ("UsagePage", wintypes.USHORT),
-        ("InputReportByteLength", wintypes.USHORT),
-        ("OutputReportByteLength", wintypes.USHORT),
-        ("FeatureReportByteLength", wintypes.USHORT),
-        ("Reserved", wintypes.USHORT * 17),
-        ("NumberLinkCollectionNodes", wintypes.USHORT),
-        ("NumberInputButtonCaps", wintypes.USHORT),
-        ("NumberInputValueCaps", wintypes.USHORT),
-        ("NumberInputDataIndices", wintypes.USHORT),
-        ("NumberOutputButtonCaps", wintypes.USHORT),
-        ("NumberOutputValueCaps", wintypes.USHORT),
-        ("NumberOutputDataIndices", wintypes.USHORT),
-        ("NumberFeatureButtonCaps", wintypes.USHORT),
-        ("NumberFeatureValueCaps", wintypes.USHORT),
-        ("NumberFeatureDataIndices", wintypes.USHORT),
-    ]
-
-
-# Explicit signatures are not optional here: without them ctypes truncates
-# 64-bit HANDLEs and the calls fail with confusing overflow errors.
-kernel32.CreateFileW.restype = wintypes.HANDLE
-kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-                                 ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
-                                 wintypes.HANDLE]
-kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-
-setupapi.SetupDiGetClassDevsW.restype = wintypes.HANDLE
-setupapi.SetupDiGetClassDevsW.argtypes = [ctypes.POINTER(GUID), wintypes.LPCWSTR,
-                                          wintypes.HWND, wintypes.DWORD]
-setupapi.SetupDiDestroyDeviceInfoList.argtypes = [wintypes.HANDLE]
-setupapi.SetupDiEnumDeviceInterfaces.argtypes = [
-    wintypes.HANDLE, ctypes.c_void_p, ctypes.POINTER(GUID), wintypes.DWORD,
-    ctypes.POINTER(SP_DEVICE_INTERFACE_DATA)]
-setupapi.SetupDiGetDeviceInterfaceDetailW.argtypes = [
-    wintypes.HANDLE, ctypes.POINTER(SP_DEVICE_INTERFACE_DATA), ctypes.c_void_p,
-    wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
-
-hid.HidD_GetHidGuid.argtypes = [ctypes.POINTER(GUID)]
-hid.HidD_GetAttributes.argtypes = [wintypes.HANDLE, ctypes.POINTER(HIDD_ATTRIBUTES)]
-hid.HidD_GetPreparsedData.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_void_p)]
-hid.HidD_FreePreparsedData.argtypes = [ctypes.c_void_p]
-hid.HidP_GetCaps.argtypes = [ctypes.c_void_p, ctypes.POINTER(HIDP_CAPS)]
-hid.HidD_SetOutputReport.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.ULONG]
+# ---------------------------------------------------------------- hidraw ----
 
 
 def find_device(vid, pid):
-    """Return (handle, output_report_len) for the first matching HID device."""
-    guid = GUID()
-    hid.HidD_GetHidGuid(ctypes.byref(guid))
-    dev_info = setupapi.SetupDiGetClassDevsW(
-        ctypes.byref(guid), None, None, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE)
-    if dev_info == INVALID_HANDLE:
-        raise OSError("SetupDiGetClassDevs failed")
+    """Return (HidDevice, output payload length) for the first matching device.
 
-    try:
-        idx = 0
-        while True:
-            iface = SP_DEVICE_INTERFACE_DATA()
-            iface.cbSize = ctypes.sizeof(SP_DEVICE_INTERFACE_DATA)
-            if not setupapi.SetupDiEnumDeviceInterfaces(
-                    dev_info, None, ctypes.byref(guid), idx, ctypes.byref(iface)):
-                return None, 0
-            idx += 1
+    HalfKay presents a single HID interface, so the first match is the one.
+    """
+    interfaces = linuxhid.enumerate_interfaces(vid, pid)
+    if not interfaces:
+        return None, 0
 
-            needed = wintypes.DWORD()
-            setupapi.SetupDiGetDeviceInterfaceDetailW(
-                dev_info, ctypes.byref(iface), None, 0, ctypes.byref(needed), None)
-            buf = ctypes.create_string_buffer(needed.value)
-            # cbSize of the detail struct itself: 8 on 64-bit, 6 on 32-bit.
-            ctypes.cast(buf, ctypes.POINTER(wintypes.DWORD))[0] = (
-                8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 6)
-            if not setupapi.SetupDiGetDeviceInterfaceDetailW(
-                    dev_info, ctypes.byref(iface), buf, needed, None, None):
-                continue
-            path = ctypes.wstring_at(ctypes.addressof(buf) + ctypes.sizeof(wintypes.DWORD))
+    itf = interfaces[0]
+    caps = itf["caps"]
+    print("found %04X:%04X at %s  usage_page=0x%04X usage=0x%04X  "
+          "output report=%d bytes"
+          % (vid, pid, itf["path"], caps.UsagePage, caps.Usage,
+             caps.OutputReportByteLength))
 
-            handle = kernel32.CreateFileW(
-                path, GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING, 0, None)
-            if handle == INVALID_HANDLE:
-                continue
+    # A 1088-byte block cannot go out on an interrupt endpoint, and the proxy's
+    # hold-off only applies to the control path. If this interface ever grows an
+    # OUT endpoint, the kernel would route writes there and both of those
+    # assumptions break -- so say so rather than write blocks into a path that
+    # was never tested.
+    if itf["has_out_ep"]:
+        print("WARNING: this interface has an interrupt OUT endpoint, so the "
+              "kernel will not send blocks over the control pipe -- that is not "
+              "the path the proxy hold-off protects")
 
-            attrs = HIDD_ATTRIBUTES()
-            attrs.Size = ctypes.sizeof(attrs)
-            if hid.HidD_GetAttributes(handle, ctypes.byref(attrs)) and \
-                    attrs.VendorID == vid and attrs.ProductID == pid:
-                pp = ctypes.c_void_p()
-                out_len = 0
-                if hid.HidD_GetPreparsedData(handle, ctypes.byref(pp)):
-                    caps = HIDP_CAPS()
-                    hid.HidP_GetCaps(pp, ctypes.byref(caps))
-                    out_len = caps.OutputReportByteLength
-                    hid.HidD_FreePreparsedData(pp)
-                    print("found %04X:%04X  usage_page=0x%04X usage=0x%04X  "
-                          "output report=%d bytes"
-                          % (vid, pid, caps.UsagePage, caps.Usage, out_len))
-                return handle, out_len
-
-            kernel32.CloseHandle(handle)
-    finally:
-        setupapi.SetupDiDestroyDeviceInfoList(dev_info)
+    device = linuxhid.HidDevice(itf["path"], caps, itf["has_out_ep"], itf["mi"])
+    return device, caps.OutputReportByteLength
 
 
 # --------------------------------------------------------- proxy health ----
@@ -315,11 +215,11 @@ def find_proxy_console(vid, pid):
     A real key has no such console, which is exactly how we tell the two apart.
     """
     try:
-        from serial.tools import list_ports
+        import rig  # also gives us the comports() that survives a mid-scan unplug
     except ImportError:
         return None
     want = "VID:PID=%04X:%04X" % (vid, pid)
-    for port in list_ports.comports():
+    for port in rig.comports():
         if want in (port.hwid or "").upper():
             return port.device
     return None
@@ -358,12 +258,9 @@ def read_intel_hex(path, code_size):
 
 # ---------------------------------------------------------------- flash ----
 
-def write_report(handle, payload, out_len):
-    """Send one HalfKay packet as a control-pipe SET_REPORT (report ID 0)."""
-    buf = ctypes.create_string_buffer(out_len)
-    buf[0] = 0  # report ID
-    ctypes.memmove(ctypes.addressof(buf) + 1, bytes(payload), len(payload))
-    return bool(hid.HidD_SetOutputReport(handle, buf, out_len))
+def write_report(device, payload):
+    """Send one HalfKay packet as an output report (report ID 0)."""
+    return device.write(payload)
 
 
 def main():
@@ -375,7 +272,7 @@ def main():
     ap.add_argument("--block-size", type=int, default=1024)
     ap.add_argument("--boot-only", action="store_true")
     ap.add_argument("--no-reboot", action="store_true")
-    ap.add_argument("--console", help="proxy console port, e.g. COM15")
+    ap.add_argument("--console", help="proxy console port, e.g. /dev/ttyACM0")
     ap.add_argument("--no-health", action="store_true",
                     help="do not monitor the proxy (direct-attached key)")
     ap.add_argument("--check-every", type=int, default=16,
@@ -385,8 +282,8 @@ def main():
     if not args.hexfile and not args.boot_only:
         ap.error("need a .hex file (or --boot-only)")
 
-    handle, out_len = find_device(args.vid, args.pid)
-    if not handle:
+    device, out_len = find_device(args.vid, args.pid)
+    if not device:
         print("no %04X:%04X device found -- is it in bootloader mode?"
               % (args.vid, args.pid))
         return 1
@@ -404,11 +301,11 @@ def main():
     # 3 address bytes + 61 pad + block, matching teensy_loader_cli for
     # block_size 512/1024.
     write_size = args.block_size + 64
-    if out_len and out_len != write_size + 1:
+    # out_len is the payload length from the report descriptor; hidraw adds the
+    # report-ID byte on top, so the write itself is one byte longer.
+    if out_len and out_len != write_size:
         print("WARNING: device reports %d-byte output reports, expected %d"
-              % (out_len, write_size + 1))
-    if not out_len:
-        out_len = write_size + 1
+              % (out_len, write_size))
 
     try:
         # Pre-flight. Refusing to start against a wedged proxy is the whole
@@ -432,7 +329,7 @@ def main():
             payload = bytearray(write_size)
             payload[0] = payload[1] = payload[2] = 0xFF
             health.expect_loss = True  # the key is about to take the console
-            if not write_report(handle, payload, out_len):
+            if not write_report(device, payload):
                 print("reboot write FAILED")
                 return 1
             print("rebooting...")
@@ -458,10 +355,9 @@ def main():
             payload[2] = (addr >> 16) & 0xFF
             payload[64:64 + args.block_size] = mem[addr:addr + args.block_size]
 
-            if not write_report(handle, payload, out_len):
-                err = ctypes.get_last_error()
-                print("\nFAILED writing block at 0x%06X (block %d), win32 error %d"
-                      % (addr, blocks, err))
+            if not write_report(device, payload):
+                print("\nFAILED writing block at 0x%06X (block %d): %s"
+                      % (addr, blocks, device.last_error))
                 return 1
 
             # The first write erases the chip and takes far longer than the
@@ -495,7 +391,7 @@ def main():
             payload = bytearray(write_size)
             payload[0] = payload[1] = payload[2] = 0xFF
             health.expect_loss = True  # rebooting takes the console with it
-            if not write_report(handle, payload, out_len):
+            if not write_report(device, payload):
                 print("reboot write FAILED")
                 return 1
             health.check("reboot")
@@ -506,7 +402,7 @@ def main():
         return 2
     finally:
         health.close()
-        kernel32.CloseHandle(handle)
+        device.close()
 
 
 if __name__ == "__main__":

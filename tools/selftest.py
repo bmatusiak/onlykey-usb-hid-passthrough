@@ -97,11 +97,14 @@ def test_interface_numbering():
     nodes = rig.usb_nodes(rig.APP_IDS)
     if not nodes:
         return "no USB nodes for %s" % rig.APP_IDS
-    # HID\...&MI_02 is the raw HID interface bound by the HID class driver.
-    if not any("MI_02" in n and n.startswith("HID") for n in nodes):
-        return ("no HID node at MI_02 -- OnlyKey software locates raw HID by "
-                "interface number and will talk to the wrong one. Nodes: %s"
-                % nodes)
+    # Interface 2 must be claimed by usbhid AND expose a hidraw node: bound by
+    # the HID driver is what makes it reachable, and the hidraw node is what
+    # okprobe and the OnlyKey tools actually open.
+    if not any("MI_02" in n and "driver=usbhid" in n and "hidraw" in n
+               for n in nodes):
+        return ("no usbhid-bound hidraw node at MI_02 -- OnlyKey software "
+                "locates raw HID by interface number and will talk to the "
+                "wrong one. Nodes: %s" % nodes)
     return None
 
 
@@ -692,7 +695,12 @@ def main():
         try:
             problem = func()
         except Exception as exc:
-            problem = "raised %s: %s" % (type(exc).__name__, exc)
+            # With the traceback, because "raised TypeError: int() can't
+            # convert non-string with explicit base" is true, useless, and
+            # points at neither the caller nor the library that raised it.
+            import traceback
+            problem = "raised %s: %s\n\n%s" % (
+                type(exc).__name__, exc, traceback.format_exc())
         if problem:
             print("FAIL  (%.0fs)\n" % (time.time() - began))
             print("    %s\n" % problem)
